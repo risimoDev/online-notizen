@@ -2,7 +2,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
 
 from app.config import settings
@@ -19,6 +19,7 @@ class OpenRouterService:
         self.fallback_models = settings.fallback_models_list
         self.dynamic_free_models: List[str] = []
         self.model_cooldowns: Dict[str, float] = {}  # model_id -> time when cooldown expires
+        self.permanently_unavailable: Set[str] = set()  # модели, вернувшие 404/400
         self.last_models_fetch_time: float = 0
         self.cache_ttl_seconds = 3600 * 4  # обновлять список моделей раз в 4 часа
 
@@ -34,11 +35,10 @@ class OpenRouterService:
                 resp = await client.get(f"{OPENROUTER_API_BASE}/models", headers=headers)
                 if resp.status_code == 200:
                     data = resp.json().get("data", [])
-                    free_models = []
+                    free_models = ["openrouter/free"]
                     for m in data:
                         model_id = m.get("id", "")
                         pricing = m.get("pricing", {})
-                        # Проверяем, бесплатна ли модель (:free в id или нулевая стоимость токенов)
                         is_free = (
                             ":free" in model_id
                             or (
@@ -46,11 +46,14 @@ class OpenRouterService:
                                 and str(pricing.get("completion", "")).strip() in ["0", "0.0", "0.00"]
                             )
                         )
-                        if is_free and model_id not in free_models:
+                        if is_free and model_id not in free_models and model_id not in self.permanently_unavailable:
                             free_models.append(model_id)
 
                     # Сортируем модели по качеству/приоритету
-                    priority_keywords = ["llama-3.3-70b", "gemini-2.0", "qwen-2.5-72b", "mistral-small", "deepseek-r1", "gemini-1.5"]
+                    priority_keywords = [
+                        "openrouter/free", "qwen3.8", "qwen", "gemma-4", "glm", "nemotron-3", 
+                        "nex", "liquid", "llama-3.3", "gemini-2.0", "mistral"
+                    ]
                     
                     def score_model(mod: str) -> int:
                         for idx, kw in enumerate(priority_keywords):
@@ -76,10 +79,18 @@ class OpenRouterService:
                 self.dynamic_free_models = fetched
                 self.last_models_fetch_time = now
 
-        # Объединяем fallback и полученные динамически
+        # Приоритет: динамический список живых моделей, затем fallback
         all_models = []
-        for m in self.fallback_models + self.dynamic_free_models:
-            if m not in all_models:
+        if "openrouter/free" not in self.permanently_unavailable:
+            all_models.append("openrouter/free")
+
+        if self.dynamic_free_models:
+            for m in self.dynamic_free_models:
+                if m not in all_models and m not in self.permanently_unavailable:
+                    all_models.append(m)
+
+        for m in self.fallback_models:
+            if m not in all_models and m not in self.permanently_unavailable:
                 all_models.append(m)
 
         # Фильтруем те, у которых не истек кулдаун (например, после 429 ошибки)
@@ -91,7 +102,7 @@ class OpenRouterService:
             self.model_cooldowns.clear()
             available = all_models
 
-        return available or ["meta-llama/llama-3.3-70b-instruct:free"]
+        return available or ["openrouter/free"]
 
     def mark_model_cooldown(self, model_id: str, duration_seconds: int = 180):
         """Временно помечает модель как недоступную (кулдаун при 429 или 5xx)."""
@@ -102,7 +113,7 @@ class OpenRouterService:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.2,
-        max_retries: int = 6
+        max_retries: int = 12
     ) -> Tuple[str, str]:
         """
         Выполняет запрос к OpenRouter с автоматической ротацией бесплатных моделей.
@@ -122,7 +133,6 @@ class OpenRouterService:
         for model in models_to_try:
             if attempts >= max_retries:
                 break
-            attempts += 1
 
             payload = {
                 "model": model,
@@ -150,20 +160,32 @@ class OpenRouterService:
                         # Пустой ответ от модели
                         logger.warning(f"Модель {model} вернула пустой ответ choices.")
                         self.mark_model_cooldown(model, 60)
+                        attempts += 1
+                    elif resp.status_code == 404 or (resp.status_code == 400 and ("not a valid model" in resp.text or "unavailable for free" in resp.text)):
+                        # Модель не существует или больше не бесплатна на OpenRouter — удаляем навсегда
+                        logger.warning(f"Модель {model} исключена из ротации (404/400): {resp.text[:120]}")
+                        self.permanently_unavailable.add(model)
+                        if model in self.dynamic_free_models:
+                            self.dynamic_free_models.remove(model)
+                        # Не увеличиваем attempts, сразу пробуем следующую
                     elif resp.status_code in (429, 500, 502, 503, 504):
-                        logger.warning(f"Модель {model} ответила статусом {resp.status_code}: {resp.text[:150]}")
+                        logger.warning(f"Модель {model} ответила статусом {resp.status_code}: {resp.text[:120]}")
                         self.mark_model_cooldown(model, 180)
+                        attempts += 1
                     else:
-                        logger.error(f"Модель {model} вернула неожиданный статус {resp.status_code}: {resp.text[:200]}")
+                        logger.error(f"Модель {model} вернула неожиданный статус {resp.status_code}: {resp.text[:150]}")
                         self.mark_model_cooldown(model, 300)
+                        attempts += 1
 
             except httpx.TimeoutException:
                 logger.warning(f"Таймаут запроса к модели {model}")
                 self.mark_model_cooldown(model, 120)
+                attempts += 1
             except Exception as e:
                 logger.warning(f"Исключение при обращении к {model}: {e}")
                 self.mark_model_cooldown(model, 120)
                 last_error = e
+                attempts += 1
 
         raise RuntimeError(f"Все доступные бесплатные модели OpenRouter завершились с ошибкой. Последняя: {last_error}")
 

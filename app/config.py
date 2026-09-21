@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     
     openrouter_api_key: str = Field(..., alias="OPENROUTER_API_KEY")
     openrouter_fallback_models: str = Field(
-        "meta-llama/llama-3.3-70b-instruct:free,google/gemini-2.0-flash-thinking-exp:free,google/gemini-2.0-flash-001:free,mistralai/mistral-small-3.2-24b-instruct:free,qwen/qwen-2.5-72b-instruct:free,deepseek/deepseek-r1:free",
+        "openrouter/free,qwen/qwen3.8-27b:free,google/gemma-4-31b-it:free,z-ai/glm-5.2:free,nvidia/nemotron-3-super-120b-a12b:free,liquid/lfm-2.5-2.6b:free",
         alias="OPENROUTER_FALLBACK_MODELS"
     )
     

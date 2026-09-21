@@ -84,7 +84,7 @@ async def create_note_with_tasks(
             res = await session.execute(stmt)
             saved_note = res.scalar_one()
 
-            return saved_note, list(saved_note.tasks)
+            return saved_note, created_tasks
 
 
 async def get_note_by_id(note_id: int) -> Optional[Note]:

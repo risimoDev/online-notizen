@@ -25,16 +25,8 @@ class WhitelistMiddleware(BaseMiddleware):
 
         # Если список разрешенных ID не пуст, проверяем пользователя
         if allowed_ids and user_id not in allowed_ids:
-            logger.warning(f"Неавторизованный доступ от Telegram ID: {user_id}")
-            if isinstance(event, Message):
-                await event.answer(
-                    f"🔒 <b>Доступ ограничен</b>\n\n"
-                    f"Ваш Telegram ID: <code>{user_id}</code>\n"
-                    f"Для получения доступа укажите этот ID в параметре <code>ALLOWED_TELEGRAM_IDS</code> в файле .env бота.",
-                    parse_mode="HTML"
-                )
-            elif isinstance(event, CallbackQuery):
-                await event.answer("🔒 Доступ ограничен. Ваш ID не в списке разрешенных.", show_alert=True)
+            logger.warning(f"Игнорирование сообщения от неавторизованного Telegram ID: {user_id}")
+            # Полное игнорирование без отправки каких-либо сообщений
             return
 
         return await handler(event, data)

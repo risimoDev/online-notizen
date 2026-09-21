@@ -66,6 +66,7 @@ async def create_note_with_tasks(
 
                     task = Task(
                         user_id=user_id,
+                        note_id=note.id,
                         note=note,
                         title=td.get("title", "Задача"),
                         due_date=due_date,

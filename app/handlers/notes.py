@@ -146,7 +146,7 @@ async def cb_view_note(callback: types.CallbackQuery):
     note_id = int(callback.data.split(":")[1])
     note = await get_note_by_id(note_id)
 
-    if not note:
+    if not note or note.user_id != callback.from_user.id:
         await callback.answer("Заметка не найдена или удалена.", show_alert=True)
         return
 
@@ -197,7 +197,7 @@ async def cb_note_tasks_edit(callback: types.CallbackQuery):
     note_id = int(callback.data.split(":")[1])
     note = await get_note_by_id(note_id)
 
-    if not note or not note.tasks:
+    if not note or note.user_id != callback.from_user.id or not note.tasks:
         await callback.answer("У этой заметки нет задач.", show_alert=True)
         return
 

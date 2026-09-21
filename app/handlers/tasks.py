@@ -94,7 +94,7 @@ async def cb_task_view(callback: types.CallbackQuery):
     task_id = int(callback.data.split(":")[1])
     task = await get_task_by_id(task_id)
 
-    if not task:
+    if not task or task.user_id != callback.from_user.id:
         await callback.answer("Задача не найдена или была удалена.", show_alert=True)
         return
 
@@ -122,7 +122,7 @@ async def cb_task_done(callback: types.CallbackQuery):
     task_id = int(callback.data.split(":")[1])
     task = await get_task_by_id(task_id)
 
-    if not task:
+    if not task or task.user_id != callback.from_user.id:
         await callback.answer("Задача не найдена.", show_alert=True)
         return
 
@@ -141,7 +141,7 @@ async def cb_task_postpone(callback: types.CallbackQuery):
     minutes = int(parts[2])
 
     task = await get_task_by_id(task_id)
-    if not task:
+    if not task or task.user_id != callback.from_user.id:
         await callback.answer("Задача не найдена.", show_alert=True)
         return
 
@@ -165,7 +165,7 @@ async def cb_task_postpone(callback: types.CallbackQuery):
 async def cb_task_postpone_tomorrow(callback: types.CallbackQuery):
     task_id = int(callback.data.split(":")[1])
     task = await get_task_by_id(task_id)
-    if not task:
+    if not task or task.user_id != callback.from_user.id:
         await callback.answer("Задача не найдена.", show_alert=True)
         return
 
@@ -188,7 +188,7 @@ async def cb_task_postpone_tomorrow(callback: types.CallbackQuery):
 async def cb_task_custom_time(callback: types.CallbackQuery):
     task_id = int(callback.data.split(":")[1])
     task = await get_task_by_id(task_id)
-    if not task:
+    if not task or task.user_id != callback.from_user.id:
         await callback.answer("Задача не найдена.", show_alert=True)
         return
 
@@ -208,7 +208,7 @@ async def cb_task_set_fixed(callback: types.CallbackQuery):
     preset = parts[2]
 
     task = await get_task_by_id(task_id)
-    if not task:
+    if not task or task.user_id != callback.from_user.id:
         await callback.answer("Задача не найдена.", show_alert=True)
         return
 
@@ -237,6 +237,10 @@ async def cb_task_set_fixed(callback: types.CallbackQuery):
 @router.callback_query(F.data.startswith("task_clear_time:"))
 async def cb_task_clear_time(callback: types.CallbackQuery):
     task_id = int(callback.data.split(":")[1])
+    task = await get_task_by_id(task_id)
+    if not task or task.user_id != callback.from_user.id:
+        await callback.answer("Задача не найдена.", show_alert=True)
+        return
     await update_task_timing(task_id=task_id, due_date=None, remind_at=None)
     await callback.answer("Срок и напоминание удалены.")
     await callback.message.edit_text("⏳ Срок задачи снят (без срока).")

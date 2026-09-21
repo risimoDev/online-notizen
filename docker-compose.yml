@@ -1,0 +1,27 @@
+services:
+  myzapis-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: myzapis-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Asia/Yekaterinburg
+    volumes:
+      - ./data:/app/data
+      - ./temp_audio:/app/temp_audio
+    # Бот работает через Long Polling и не открывает внешних сетевых портов,
+    # что полностью исключает конфликты с другими веб-сервисами и ботами на сервере.
+    networks:
+      - myzapis-internal-net
+    deploy:
+      resources:
+        limits:
+          memory: 2048M
+
+networks:
+  myzapis-internal-net:
+    driver: bridge

@@ -1,0 +1,1 @@
+"""MyZapis Telegram Bot Package."""

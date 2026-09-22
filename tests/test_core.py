@@ -1,15 +1,20 @@
 import os
+import sys
 import asyncio
 import tempfile
+import uuid
 from datetime import datetime, timedelta
 import pytz
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+test_db_path = os.path.join(tempfile.gettempdir(), f"test_core_{uuid.uuid4().hex}.db")
 # Настраиваем фиктивные переменные окружения для тестов
 os.environ["BOT_TOKEN"] = "123456789:TEST_BOT_TOKEN_ABCDEFGHI"
 os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-testkey"
 os.environ["ALLOWED_TELEGRAM_IDS"] = "111111,222222"
 os.environ["TIMEZONE"] = "Asia/Yekaterinburg"
-os.environ["DB_PATH"] = os.path.join(tempfile.gettempdir(), "test_myzapis.db")
+os.environ["DB_PATH"] = test_db_path
 
 from app.config import settings
 from app.utils.date_utils import (

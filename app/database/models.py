@@ -46,3 +46,41 @@ class Task(Base):
 
     def __repr__(self):
         return f"<Task id={self.id} title={self.title!r} due_date={self.due_date} status={self.status}>"
+
+
+class Contact(Base):
+    __tablename__ = "contacts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False, index=True)
+    name = Column(String(100), nullable=False, index=True)
+    normalized_name = Column(String(100), nullable=False, index=True)
+    role_or_company = Column(String(255), nullable=True)
+    contact_info = Column(String(255), nullable=True)
+    birthday = Column(String(50), nullable=True)
+    notes_summary = Column(Text, nullable=True)
+    agreements = Column(Text, nullable=True)
+    last_interaction = Column(DateTime, default=get_now_yekt, nullable=False, index=True)
+    created_at = Column(DateTime, default=get_now_yekt, nullable=False)
+
+    interactions = relationship("ContactInteraction", back_populates="contact", cascade="all, delete-orphan", lazy="selectin")
+
+    def __repr__(self):
+        return f"<Contact id={self.id} name={self.name!r} user_id={self.user_id}>"
+
+
+class ContactInteraction(Base):
+    __tablename__ = "contact_interactions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    contact_id = Column(Integer, ForeignKey("contacts.id", ondelete="CASCADE"), nullable=False, index=True)
+    note_id = Column(Integer, ForeignKey("notes.id", ondelete="SET NULL"), nullable=True, index=True)
+    summary = Column(Text, nullable=True)
+    agreements = Column(Text, nullable=True)
+    interaction_date = Column(DateTime, default=get_now_yekt, nullable=False, index=True)
+
+    contact = relationship("Contact", back_populates="interactions")
+    note = relationship("Note")
+
+    def __repr__(self):
+        return f"<ContactInteraction id={self.id} contact_id={self.contact_id}>"

@@ -7,7 +7,7 @@ from sqlalchemy import select, update, delete, or_, and_, desc
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
-from app.database.models import Base, Note, Task
+from app.database.models import Base, Note, Task, Contact, ContactInteraction
 from app.utils.date_utils import get_now_yekt, calculate_remind_at
 
 # Убеждаемся, что папка для базы данных существует
@@ -268,3 +268,174 @@ async def mark_task_reminded(task_id: int):
         async with session.begin():
             stmt = update(Task).where(Task.id == task_id).values(reminded=True)
             await session.execute(stmt)
+
+
+# -------------------- CRM (Contacts) Operations --------------------
+
+async def upsert_contact_from_ai(
+    user_id: int,
+    person_data: dict,
+    note_id: Optional[int] = None
+) -> Optional[Contact]:
+    """Создает или дополняет карточку контакта на основе распознанных ИИ данных."""
+    name = person_data.get("name", "").strip()
+    if not name or len(name) < 2:
+        return None
+
+    normalized = name.lower()
+    now = get_now_yekt()
+    now_str = now.strftime("%d.%m.%Y")
+
+    new_facts = person_data.get("facts", "").strip() if person_data.get("facts") else ""
+    new_agreements = person_data.get("agreements", "").strip() if person_data.get("agreements") else ""
+    new_role = person_data.get("role", "").strip() if person_data.get("role") else ""
+    new_info = person_data.get("contact_info", "").strip() if person_data.get("contact_info") else ""
+    new_bday = person_data.get("birthday", "").strip() if person_data.get("birthday") else ""
+
+    async with async_session_maker() as session:
+        async with session.begin():
+            stmt = (
+                select(Contact)
+                .options(selectinload(Contact.interactions))
+                .where(and_(Contact.user_id == user_id, Contact.normalized_name == normalized))
+            )
+            res = await session.execute(stmt)
+            contact = res.scalar_one_or_none()
+
+            if contact:
+                contact.last_interaction = now
+                if new_role and not contact.role_or_company:
+                    contact.role_or_company = new_role
+                if new_info and not contact.contact_info:
+                    contact.contact_info = new_info
+                if new_bday and not contact.birthday:
+                    contact.birthday = new_bday
+
+                if new_facts:
+                    entry = f"• [{now_str}]: {new_facts}"
+                    if contact.notes_summary:
+                        contact.notes_summary = f"{contact.notes_summary}\n{entry}"
+                    else:
+                        contact.notes_summary = entry
+
+                if new_agreements:
+                    agr_entry = f"• [{now_str}]: {new_agreements}"
+                    if contact.agreements:
+                        contact.agreements = f"{contact.agreements}\n{agr_entry}"
+                    else:
+                        contact.agreements = agr_entry
+            else:
+                initial_summary = f"• [{now_str}]: {new_facts}" if new_facts else None
+                initial_agr = f"• [{now_str}]: {new_agreements}" if new_agreements else None
+                contact = Contact(
+                    user_id=user_id,
+                    name=name,
+                    normalized_name=normalized,
+                    role_or_company=new_role or None,
+                    contact_info=new_info or None,
+                    birthday=new_bday or None,
+                    notes_summary=initial_summary,
+                    agreements=initial_agr,
+                    last_interaction=now,
+                    created_at=now
+                )
+                session.add(contact)
+                await session.flush()
+
+            # Добавляем запись взаимодействия
+            interaction = ContactInteraction(
+                contact_id=contact.id,
+                note_id=note_id,
+                summary=new_facts or None,
+                agreements=new_agreements or None,
+                interaction_date=now
+            )
+            session.add(interaction)
+            await session.flush()
+            await session.refresh(contact)
+            return contact
+
+
+async def get_user_contacts(user_id: int, limit: int = 50) -> List[Contact]:
+    """Возвращает контакты пользователя, отсортированные по последнему общению."""
+    async with async_session_maker() as session:
+        stmt = (
+            select(Contact)
+            .options(selectinload(Contact.interactions))
+            .where(Contact.user_id == user_id)
+            .order_by(desc(Contact.last_interaction))
+            .limit(limit)
+        )
+        res = await session.execute(stmt)
+        return list(res.scalars().all())
+
+
+async def get_contact_by_name(user_id: int, query_name: str) -> Optional[Contact]:
+    """Поиск контакта по имени (точное совпадение или подстрока)."""
+    norm = query_name.strip().lower()
+    async with async_session_maker() as session:
+        # Сначала точное совпадение
+        stmt = (
+            select(Contact)
+            .options(selectinload(Contact.interactions))
+            .where(and_(Contact.user_id == user_id, Contact.normalized_name == norm))
+        )
+        res = await session.execute(stmt)
+        c = res.scalar_one_or_none()
+        if c:
+            return c
+
+        # Иначе поиск по подстроке
+        stmt = (
+            select(Contact)
+            .options(selectinload(Contact.interactions))
+            .where(and_(Contact.user_id == user_id, Contact.normalized_name.ilike(f"%{norm}%")))
+            .order_by(desc(Contact.last_interaction))
+            .limit(1)
+        )
+        res = await session.execute(stmt)
+        return res.scalar_one_or_none()
+
+
+async def get_contact_by_id(contact_id: int, user_id: int) -> Optional[Contact]:
+    async with async_session_maker() as session:
+        stmt = (
+            select(Contact)
+            .options(selectinload(Contact.interactions))
+            .where(and_(Contact.id == contact_id, Contact.user_id == user_id))
+        )
+        res = await session.execute(stmt)
+        return res.scalar_one_or_none()
+
+
+async def delete_contact_by_id(contact_id: int, user_id: int) -> bool:
+    async with async_session_maker() as session:
+        async with session.begin():
+            stmt = delete(Contact).where(and_(Contact.id == contact_id, Contact.user_id == user_id))
+            res = await session.execute(stmt)
+            return res.rowcount > 0
+
+
+# -------------------- Day Planner Operations --------------------
+
+async def batch_update_task_timings(user_id: int, task_timings: List[dict]) -> int:
+    """Обновляет due_date и remind_at для нескольких задач сразу."""
+    count = 0
+    async with async_session_maker() as session:
+        async with session.begin():
+            for item in task_timings:
+                tid = item.get("task_id")
+                due = item.get("due_date")
+                remind = item.get("remind_at")
+                if due and not remind:
+                    remind = calculate_remind_at(due)
+
+                stmt = (
+                    update(Task)
+                    .where(and_(Task.id == tid, Task.user_id == user_id))
+                    .values(due_date=due, remind_at=remind, reminded=False)
+                )
+                res = await session.execute(stmt)
+                count += res.rowcount
+    return count
+

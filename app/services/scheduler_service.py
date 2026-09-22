@@ -62,6 +62,18 @@ class SchedulerService:
         except Exception as e:
             logger.warning(f"Не удалось запланировать вечерний отчет: {e}")
 
+        # 4. Еженедельный бэкап базы данных (каждое воскресенье в 03:00 YEKT)
+        try:
+            self.scheduler.add_job(
+                self.run_scheduled_backup,
+                trigger=CronTrigger(day_of_week="sun", hour=3, minute=0, timezone=get_tz()),
+                id="weekly_backup",
+                replace_existing=True
+            )
+            logger.info("Еженедельный бэкап базы данных запланирован на вс 03:00 YEKT")
+        except Exception as e:
+            logger.warning(f"Не удалось запланировать еженедельный бэкап: {e}")
+
     def start(self):
         if not self.scheduler.running:
             self.scheduler.start()
@@ -172,6 +184,17 @@ class SchedulerService:
                 )
             except Exception as e:
                 logger.error(f"Ошибка вечернего отчета для {user_id}: {e}")
+
+    async def run_scheduled_backup(self):
+        """Запуск регулярного еженедельного бэкапа базы данных."""
+        if not self.bot:
+            return
+        logger.info("Запуск еженедельного бэкапа базы данных...")
+        try:
+            from app.services.backup_service import send_backup_to_users
+            await send_backup_to_users(self.bot)
+        except Exception as e:
+            logger.error(f"Ошибка при выполнении запланированного бэкапа: {e}")
 
 
 scheduler_service = SchedulerService()

@@ -3,9 +3,22 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
-def get_note_created_keyboard(note_id: int, tasks: Optional[List] = None) -> InlineKeyboardMarkup:
+def get_note_created_keyboard(
+    note_id: int,
+    tasks: Optional[List] = None,
+    matched_note: Optional[dict] = None
+) -> InlineKeyboardMarkup:
     """Клавиатура под только что созданной заметкой."""
     builder = InlineKeyboardBuilder()
+
+    if matched_note and matched_note.get("matched_note_id"):
+        title_snip = matched_note.get("matched_note_title", "заметку")[:20]
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🔗 Связь: {title_snip}",
+                callback_data=f"view_note:{matched_note['matched_note_id']}"
+            )
+        )
 
     if tasks:
         builder.row(

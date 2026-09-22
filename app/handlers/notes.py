@@ -11,7 +11,8 @@ from app.database.session import (
     get_note_by_id,
     delete_note_by_id,
     search_notes,
-    get_user_tasks
+    get_user_tasks,
+    upsert_contact_from_ai
 )
 from app.utils.date_utils import format_datetime_human
 from app.utils.keyboards import get_note_created_keyboard, get_tasks_list_keyboard
@@ -237,6 +238,7 @@ async def handle_text_note(message: types.Message):
         timeline = structured_data.get("timeline")
         tasks_list = structured_data.get("tasks", [])
         tags = structured_data.get("tags", [])
+        people_list = structured_data.get("people", [])
         model_used = structured_data.get("model_used", "OpenRouter Free")
 
         # 2. Сохранение в БД
@@ -250,7 +252,37 @@ async def handle_text_note(message: types.Message):
             tasks_data=tasks_list
         )
 
-        # 3. Красивый ответ
+        # 3. Сохранение контактов в CRM
+        for p in people_list:
+            try:
+                await upsert_contact_from_ai(user_id=user_id, person_data=p, note_id=note.id)
+            except Exception as pe:
+                logger.warning(f"Ошибка сохранения контакта в CRM: {pe}")
+
+        # 4. Поиск неочевидных связей (Serendipity Engine)
+        matched_link = None
+        try:
+            past_notes = await get_user_notes(user_id=user_id, limit=8)
+            past_candidates = [
+                {
+                    "id": pn.id,
+                    "title": pn.title,
+                    "created_at": pn.created_at.strftime("%d.%m.%Y"),
+                    "summary": pn.summary,
+                    "raw_content": pn.raw_content
+                }
+                for pn in past_notes if pn.id != note.id
+            ]
+            if past_candidates:
+                matched_link = await ai_service.find_serendipity_links(
+                    new_title=title,
+                    new_content=raw_text,
+                    past_notes=past_candidates
+                )
+        except Exception as se:
+            logger.warning(f"Ошибка поиска связей Serendipity Engine: {se}")
+
+        # 5. Красивый ответ
         tags_line = " ".join([f"#{t.strip()}" for t in tags if t.strip()])
 
         msg_parts = [
@@ -265,6 +297,10 @@ async def handle_text_note(message: types.Message):
         if timeline:
             msg_parts.append(f"\n⏳ <b>Хронология / Таймлайн:</b>\n{timeline}")
 
+        if people_list:
+            people_names = [p["name"] for p in people_list]
+            msg_parts.append(f"\n👥 <b>Люди в CRM:</b> {', '.join(people_names)}")
+
         if created_tasks:
             msg_parts.append(f"\n⏰ <b>Запланированные задачи ({len(created_tasks)}):</b>")
             for idx, task in enumerate(created_tasks, 1):
@@ -272,9 +308,15 @@ async def handle_text_note(message: types.Message):
                 remind_info = f", напомню {format_datetime_human(task.remind_at)}" if task.remind_at else ""
                 msg_parts.append(f"{idx}. <b>{task.title}</b>\n   └ <i>Срок: {due_info}{remind_info}</i>")
 
+        if matched_link:
+            msg_parts.append(
+                f"\n🔮 <b>Неочевидная связь:</b>\n{matched_link['insight']}\n"
+                f"<i>(перекликается с «{matched_link['matched_note_title']}»)</i>"
+            )
+
         msg_parts.append(f"\n─────────────\n⚙️ <i>LLM: {model_used}</i>")
 
-        reply_markup = get_note_created_keyboard(note.id, created_tasks)
+        reply_markup = get_note_created_keyboard(note.id, created_tasks, matched_note=matched_link)
 
         await status_msg.edit_text(
             "\n".join(msg_parts),

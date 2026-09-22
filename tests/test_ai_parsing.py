@@ -1,6 +1,9 @@
 import os
+import sys
 import asyncio
 import json
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 os.environ["BOT_TOKEN"] = "123456789:TEST_BOT_TOKEN"
 os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-testkey"

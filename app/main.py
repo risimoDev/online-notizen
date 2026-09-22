@@ -8,7 +8,7 @@ from aiogram.enums import ParseMode
 from app.config import settings
 from app.database.session import init_db
 from app.middlewares.auth import WhitelistMiddleware
-from app.handlers import common, voice, tasks, notes
+from app.handlers import common, voice, tasks, notes, crm, planner, meeting, backup
 from app.services.scheduler_service import scheduler_service
 
 # Настройка логирования
@@ -41,8 +41,12 @@ async def main():
     dp.callback_query.middleware(whitelist_middleware)
 
     # 4. Регистрация роутеров
-    # Порядок важен: common (команды) -> voice (аудио) -> tasks (команды задач) -> notes (текст и поиск)
+    # Сначала специализированные команды, затем голосовые, задачи и общий текст
     dp.include_router(common.router)
+    dp.include_router(backup.router)
+    dp.include_router(crm.router)
+    dp.include_router(planner.router)
+    dp.include_router(meeting.router)
     dp.include_router(voice.router)
     dp.include_router(tasks.router)
     dp.include_router(notes.router)

@@ -232,6 +232,13 @@ class OpenRouterService:
    - due_date: Точная дата и время дедлайна/выполнения в формате 'YYYY-MM-DD HH:MM:SS' (или null).
    - priority: 'low', 'medium' или 'high'.
 5. tags: Список релевантных тегов (без символа #, на русском, например: ["работа", "договор", "клиент"]).
+6. people: Список людей, упомянутых в тексте/голосовом (если никто конкретно не упомянут — пустой список []):
+   - name: Имя или имя и фамилия (например: "Андрей", "Мария", "Сергей Петрович").
+   - role: Кем работает, должность или статус (или null).
+   - facts: Ключевые факты о человеке, новости, увлечения, семья (или null).
+   - agreements: Взаимные обещания или договоренности ("обещал прислать смету", "договорились созвониться в ноябре") (или null).
+   - birthday: День рождения, если упоминался (или null).
+   - contact_info: Телефон, @username, email если упоминались (или null).
 
 ФОРМАТ ОТВЕТА:
 Строго валидный JSON БЕЗ каких-либо комментариев до или после!
@@ -248,7 +255,17 @@ class OpenRouterService:
       "priority": "high"
     }}
   ],
-  "tags": ["работа", "клиент", "договор"]
+  "tags": ["работа", "клиент", "договор"],
+  "people": [
+    {{
+      "name": "Алексей",
+      "role": "Директор по закупкам",
+      "facts": "Утверждает бюджет на Q4",
+      "agreements": "Обещал выслать реквизиты до четверга",
+      "birthday": null,
+      "contact_info": null
+    }}
+  ]
 }}
 """
 
@@ -284,7 +301,8 @@ class OpenRouterService:
                     "summary": raw_text,
                     "timeline": None,
                     "tasks": [],
-                    "tags": ["заметка"]
+                    "tags": ["заметка"],
+                    "people": []
                 }
 
         # Валидация и парсинг дат в задачах
@@ -298,12 +316,26 @@ class OpenRouterService:
                     "priority": t.get("priority", "medium") if t.get("priority") in ("low", "medium", "high") else "medium"
                 })
 
+        # Обработка людей
+        people_list = []
+        for p in data.get("people", []):
+            if isinstance(p, dict) and p.get("name") and len(p.get("name", "").strip()) >= 2:
+                people_list.append({
+                    "name": p.get("name", "").strip(),
+                    "role": p.get("role"),
+                    "facts": p.get("facts"),
+                    "agreements": p.get("agreements"),
+                    "birthday": p.get("birthday"),
+                    "contact_info": p.get("contact_info")
+                })
+
         return {
             "title": data.get("title", "Заметка").strip(),
             "summary": data.get("summary", "").strip(),
             "timeline": data.get("timeline"),
             "tasks": tasks_list,
             "tags": data.get("tags", []),
+            "people": people_list,
             "model_used": model_used
         }
 
@@ -353,6 +385,245 @@ class OpenRouterService:
         ]
 
         return await self.chat_completion_with_failover(messages, temperature=0.3)
+
+    async def find_serendipity_links(
+        self,
+        new_title: str,
+        new_content: str,
+        past_notes: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Ищет неочевидные концептуальные связи между новой мыслью и прошлыми заметками.
+        Возвращает dict {"matched_note_id": int, "matched_note_title": str, "insight": str} или None.
+        """
+        if not past_notes or len(past_notes) < 1:
+            return None
+
+        system_prompt = """Ты — генератор эвристических озарений и связей (Serendipity Engine).
+Твоя задача — сопоставить НОВУЮ заметку пользователя с его ПРОШЛЫМИ заметками и найти нетривиальную, неочевидную концептуальную связь, аналогию, скрытый синергетический эффект или полезную параллель.
+
+ПРАВИЛА:
+1. Не притягивай за уши очевидные или тривиальные вещи (например, если обе заметки содержат слово "купить").
+2. Ищи параллели: похожие механики решений в разных сферах, возвращение к давней идее в новом контексте, взаимно дополняющие мысли.
+3. Если настоящей полезной связи нет — строго верни JSON с matched_note_id: null.
+4. Если связь есть:
+   - matched_note_id: ID связанной заметки (число)
+   - matched_note_title: заголовок связанной заметки
+   - insight: 1-2 предложения, в чем именно инсайт и почему это ценно связать.
+
+ФОРМАТ JSON:
+{
+  "matched_note_id": 12,
+  "matched_note_title": "Идея стартапа в сфере образования",
+  "insight": "Эта новая мысль о геймификации отлично дополняет вашу августовскую идею: вы можете применить этот механизм вовлечения в том проекте."
+}
+или:
+{
+  "matched_note_id": null
+}
+"""
+
+        past_context = []
+        for n in past_notes[:10]:
+            past_context.append(
+                f"[ID {n.get('id')}] «{n.get('title')}» ({n.get('created_at')}): {n.get('summary') or n.get('raw_content', '')[:150]}"
+            )
+
+        user_content = f"НОВАЯ ЗАМЕТКА:\nЗаголовок: {new_title}\nТекст: {new_content}\n\nПРОШЛЫЕ ЗАМЕТКИ ДЛЯ АНАЛИЗА:\n" + "\n".join(past_context)
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ]
+
+        try:
+            content, _ = await self.chat_completion_with_failover(messages, temperature=0.3)
+            clean = content.strip()
+            if "```json" in clean:
+                clean = clean.split("```json")[1].split("```")[0].strip()
+            elif "```" in clean:
+                clean = clean.split("```")[1].split("```")[0].strip()
+            
+            data = json.loads(clean)
+            if data.get("matched_note_id") and data.get("insight"):
+                return {
+                    "matched_note_id": int(data["matched_note_id"]),
+                    "matched_note_title": data.get("matched_note_title", "Заметка"),
+                    "insight": data["insight"].strip()
+                }
+        except Exception as e:
+            logger.warning(f"Serendipity Engine exception: {e}")
+        return None
+
+    async def plan_day_schedule(
+        self,
+        tasks: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Интеллектуальное планирование дня (AI Day Planner).
+        Распределяет задачи пользователя по умным тайм-слотам с учетом биоритмов и дедлайнов.
+        """
+        now = get_now_yekt()
+        now_str = now.strftime("%Y-%m-%d %H:%M")
+        today_date_str = now.strftime("%Y-%m-%d")
+
+        system_prompt = f"""Ты — персональный исполнительный коуч и специалист по тайм-менеджменту.
+Текущее время: {now_str} (UTC+5, Екатеринбург).
+Твоя задача — составить для пользователя реалистичный, сбалансированный и продуктивный распорядок дня из переданного списка задач.
+
+ПРИНЦИПЫ УМНОГО ПЛАНИРОВАНИЯ:
+1. Deep Work (Утро / Первая половина дня, обычно 10:00 - 12:30): сложные мыслительные задачи, аналитика, подготовка ключевых документов.
+2. Communications (День, обычно 13:30 - 16:00): звонки, встречи, согласования, ответы на письма.
+3. Routine & Wrap-up (Вечер, обычно 16:30 - 18:30): оплата счетов, мелкие рутинные дела, подведение итогов.
+4. Учитывай время дня: если сейчас уже 14:00, не ставь задачи на утро — планируй начиная от текущего времени!
+5. Для каждой задачи с ID сформируй рекомендованное точное время выполнения в формате 'YYYY-MM-DD HH:MM:00'.
+
+ФОРМАТ ОТВЕТА JSON:
+{{
+  "overview": "Краткое бодрое напутствие и стратегия на сегодня (1-2 предложения)",
+  "schedule_blocks": [
+    {{
+      "block_title": "🧠 Deep Work (10:00 - 12:30)",
+      "description": "Фокус на ключевой задаче дня без отвлечений",
+      "task_ids": [1, 3]
+    }},
+    {{
+      "block_title": "📞 Коммуникации и встречи (14:00 - 16:00)",
+      "description": "Созвоны и согласования",
+      "task_ids": [2]
+    }}
+  ],
+  "task_timings": [
+    {{
+      "task_id": 1,
+      "due_date": "{today_date_str} 10:00:00",
+      "time_label": "10:00"
+    }},
+    {{
+      "task_id": 3,
+      "due_date": "{today_date_str} 11:30:00",
+      "time_label": "11:30"
+    }},
+    {{
+      "task_id": 2,
+      "due_date": "{today_date_str} 14:00:00",
+      "time_label": "14:00"
+    }}
+  ]
+}}
+"""
+        tasks_text = []
+        for t in tasks:
+            tasks_text.append(
+                f"- [ID {t['id']}] «{t['title']}» (Приоритет: {t.get('priority')}, Текущий дедлайн: {t.get('due_date') or 'нет'})"
+            )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": "ЗАДАЧИ НА СЕГОДНЯ:\n" + "\n".join(tasks_text)}
+        ]
+
+        try:
+            content, model_used = await self.chat_completion_with_failover(messages, temperature=0.2)
+            clean = content.strip()
+            if "```json" in clean:
+                clean = clean.split("```json")[1].split("```")[0].strip()
+            elif "```" in clean:
+                clean = clean.split("```")[1].split("```")[0].strip()
+            data = json.loads(clean)
+            data["model_used"] = model_used
+            return data
+        except Exception as e:
+            logger.error(f"Ошибка в Day Planner: {e}")
+            return {
+                "overview": "Не удалось сформировать автоматический график.",
+                "schedule_blocks": [],
+                "task_timings": []
+            }
+
+    async def generate_meeting_protocol(
+        self,
+        raw_text: str,
+        duration_seconds: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Формирует подробный официальный протокол совещания (Meeting Minutes).
+        """
+        now = get_now_yekt()
+        now_str = now.strftime("%Y-%m-%d %H:%M")
+
+        system_prompt = f"""Ты — профессиональный секретарь и корпоративный аналитик.
+Текущее время: {now_str} (UTC+5, Екатеринбург).
+Твоя задача — проанализировать стенограмму/запись встречи и составить идеальный структурированный протокол совещания (Meeting Minutes).
+
+ОБЯЗАТЕЛЬНЫЕ РАЗДЕЛЫ В JSON:
+1. topic: Тема и цель встречи (кратко и емко).
+2. participants: Список участников, упомянутых на встрече, с должностями/ролями если понятно (например ["Дмитрий (директор)", "Анна (маркетолог)"]).
+3. timeline: Хронологическая цепочка обсуждения (поэтапно: что за чем шло, ключевые реплики).
+4. decisions: Список принятых решений и утвержденных договоренностей (что решено делать, а что отклонено).
+5. action_items: Список конкретных поручений:
+   - task: четкая формулировка задачи в повелительной форме
+   - assignee: ответственное лицо (имя) или "Не назначен"
+   - due_date: дата/время в формате 'YYYY-MM-DD HH:MM:SS' если упоминались, или null
+   - priority: low, medium, high
+6. unresolved: Открытые или спорные вопросы, перенесенные на следующий созвон (или пустой список []).
+
+ФОРМАТ СТРОГО JSON:
+{{
+  "topic": "Обсуждение редизайна и запуска рекламной кампании",
+  "participants": ["Иван (Team Lead)", "Ольга (Дизайнер)", "Максим"],
+  "timeline": [
+    "Обсудили текущие замечания клиентов по интерфейсу",
+    "Ольга показала новые макеты мобильной версии",
+    "Максим предложил перенести запуск рекламы на следующую неделю"
+  ],
+  "decisions": [
+    "Утвердить макеты экрана оформления заказа",
+    "Перенести дату старта кампании на 28 сентября"
+  ],
+  "action_items": [
+    {{
+      "task": "Передать макеты разработчикам",
+      "assignee": "Ольга",
+      "due_date": "{now.strftime('%Y-%m-%d')} 18:00:00",
+      "priority": "high"
+    }}
+  ],
+  "unresolved": [
+    "Согласование дополнительного бюджета на трафик"
+  ]
+}}
+"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"ТЕКСТ ВСТРЕЧИ:\n\"\"\"\n{raw_text}\n\"\"\""}
+        ]
+
+        content, model_used = await self.chat_completion_with_failover(messages, temperature=0.1)
+        clean = content.strip()
+        if "```json" in clean:
+            clean = clean.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean:
+            clean = clean.split("```")[1].split("```")[0].strip()
+
+        try:
+            data = json.loads(clean)
+        except Exception:
+            match = re.search(r"\{[\s\S]*\}", clean)
+            if match:
+                data = json.loads(match.group(0))
+            else:
+                data = {
+                    "topic": "Протокол встречи",
+                    "participants": [],
+                    "timeline": [],
+                    "decisions": [],
+                    "action_items": [],
+                    "unresolved": []
+                }
+
+        data["model_used"] = model_used
+        return data
 
 
 # Экземпляр сервиса

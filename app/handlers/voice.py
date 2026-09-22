@@ -1,4 +1,5 @@
 import os
+import html
 import logging
 from pathlib import Path
 from typing import Optional
@@ -115,23 +116,23 @@ async def process_audio_file(
         except Exception as se:
             logger.warning(f"Ошибка Serendipity в voice: {se}")
 
-        # 7. Формирование красивого ответа
-        tags_line = " ".join([f"#{t.strip()}" for t in tags if t.strip()])
+        # 7. Формирование красивого ответа с экранированием HTML
+        tags_line = " ".join([f"#{html.escape(str(t).strip())}" for t in tags if str(t).strip()])
         
         msg_parts = [
-            f"📝 <b>{title}</b>",
+            f"📝 <b>{html.escape(title)}</b>",
         ]
         if tags_line:
             msg_parts.append(f"📌 {tags_line}")
 
         if summary:
-            msg_parts.append(f"\n💡 <b>Главное:</b>\n{summary}")
+            msg_parts.append(f"\n💡 <b>Главное:</b>\n{html.escape(summary)}")
 
         if timeline:
-            msg_parts.append(f"\n⏳ <b>Хронология / Таймлайн:</b>\n{timeline}")
+            msg_parts.append(f"\n⏳ <b>Хронология / Таймлайн:</b>\n{html.escape(timeline)}")
 
         if people_list:
-            people_names = [p["name"] for p in people_list]
+            people_names = [html.escape(p["name"]) for p in people_list]
             msg_parts.append(f"\n👥 <b>Люди в CRM:</b> {', '.join(people_names)}")
 
         if created_tasks:
@@ -139,32 +140,42 @@ async def process_audio_file(
             for idx, task in enumerate(created_tasks, 1):
                 due_info = format_datetime_human(task.due_date)
                 remind_info = f", напомню {format_datetime_human(task.remind_at)}" if task.remind_at else ""
-                msg_parts.append(f"{idx}. <b>{task.title}</b>\n   └ <i>Срок: {due_info}{remind_info}</i>")
+                msg_parts.append(f"{idx}. <b>{html.escape(task.title)}</b>\n   └ <i>Срок: {due_info}{remind_info}</i>")
 
         if matched_link:
             msg_parts.append(
-                f"\n🔮 <b>Неочевидная связь:</b>\n{matched_link['insight']}\n"
-                f"<i>(перекликается с «{matched_link['matched_note_title']}»)</i>"
+                f"\n🔮 <b>Неочевидная связь:</b>\n{html.escape(matched_link['insight'])}\n"
+                f"<i>(перекликается с «{html.escape(matched_link['matched_note_title'])}»)</i>"
             )
 
         # Исходный текст голосового
         raw_preview = raw_text if len(raw_text) <= 500 else raw_text[:500] + "..."
-        msg_parts.append(f"\n🗣 <b>Расшифровка речи:</b>\n<i>«{raw_preview}»</i>")
+        msg_parts.append(f"\n🗣 <b>Расшифровка речи:</b>\n<i>«{html.escape(raw_preview)}»</i>")
 
         # Инфо-подвал
-        msg_parts.append(f"\n─────────────\n⚙️ <i>STT: {stt_engine} | LLM: {model_used}</i>")
+        msg_parts.append(f"\n─────────────\n⚙️ <i>STT: {html.escape(stt_engine)} | LLM: {html.escape(model_used)}</i>")
 
         reply_markup = get_note_created_keyboard(note.id, created_tasks, matched_note=matched_link)
 
-        await status_msg.edit_text(
-            "\n".join(msg_parts),
-            parse_mode="HTML",
-            reply_markup=reply_markup
-        )
+        try:
+            await status_msg.edit_text(
+                "\n".join(msg_parts),
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        except Exception:
+            await status_msg.edit_text(
+                "\n".join(msg_parts),
+                parse_mode=None,
+                reply_markup=reply_markup
+            )
 
     except Exception as e:
         logger.exception(f"Ошибка при обработке голосового сообщения: {e}")
-        await status_msg.edit_text(f"⚠️ Произошла ошибка при обработке: {e}")
+        try:
+            await status_msg.edit_text(f"⚠️ Произошла ошибка при обработке: {e}")
+        except Exception:
+            pass
     finally:
         # Удаляем временный файл
         if temp_path.exists():

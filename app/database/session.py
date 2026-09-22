@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 from pathlib import Path
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy import select, update, delete, or_, and_, desc
@@ -39,7 +39,7 @@ async def create_note_with_tasks(
     tasks_data: Optional[List[dict]] = None
 ) -> Tuple[Note, List[Task]]:
     """Создает заметку и связанные с ней задачи в одной транзакции."""
-    tags_str = ", ".join([t.strip().lstrip("#") for t in tags if t.strip()]) if tags else None
+    tags_str = ", ".join([str(t).strip().lstrip("#") for t in tags if str(t).strip()]) if tags else None
     
     async with async_session_maker() as session:
         async with session.begin():
@@ -272,13 +272,23 @@ async def mark_task_reminded(task_id: int):
 
 # -------------------- CRM (Contacts) Operations --------------------
 
+def _safe_str(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, (list, tuple)):
+        return ", ".join(str(x).strip() for x in val if str(x).strip())
+    return str(val).strip()
+
+
 async def upsert_contact_from_ai(
     user_id: int,
     person_data: dict,
     note_id: Optional[int] = None
 ) -> Optional[Contact]:
     """Создает или дополняет карточку контакта на основе распознанных ИИ данных."""
-    name = person_data.get("name", "").strip()
+    name = _safe_str(person_data.get("name"))
     if not name or len(name) < 2:
         return None
 
@@ -286,11 +296,11 @@ async def upsert_contact_from_ai(
     now = get_now_yekt()
     now_str = now.strftime("%d.%m.%Y")
 
-    new_facts = person_data.get("facts", "").strip() if person_data.get("facts") else ""
-    new_agreements = person_data.get("agreements", "").strip() if person_data.get("agreements") else ""
-    new_role = person_data.get("role", "").strip() if person_data.get("role") else ""
-    new_info = person_data.get("contact_info", "").strip() if person_data.get("contact_info") else ""
-    new_bday = person_data.get("birthday", "").strip() if person_data.get("birthday") else ""
+    new_facts = _safe_str(person_data.get("facts"))
+    new_agreements = _safe_str(person_data.get("agreements"))
+    new_role = _safe_str(person_data.get("role"))
+    new_info = _safe_str(person_data.get("contact_info"))
+    new_bday = _safe_str(person_data.get("birthday"))
 
     async with async_session_maker() as session:
         async with session.begin():

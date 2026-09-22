@@ -1,3 +1,4 @@
+import html
 import logging
 from aiogram import Router, types, F
 from aiogram.filters import Command
@@ -282,23 +283,23 @@ async def handle_text_note(message: types.Message):
         except Exception as se:
             logger.warning(f"Ошибка поиска связей Serendipity Engine: {se}")
 
-        # 5. Красивый ответ
-        tags_line = " ".join([f"#{t.strip()}" for t in tags if t.strip()])
+        # 5. Красивый ответ с защитой от HTML инъекций
+        tags_line = " ".join([f"#{html.escape(str(t).strip())}" for t in tags if str(t).strip()])
 
         msg_parts = [
-            f"📝 <b>{title}</b>",
+            f"📝 <b>{html.escape(title)}</b>",
         ]
         if tags_line:
             msg_parts.append(f"📌 {tags_line}")
 
         if summary:
-            msg_parts.append(f"\n💡 <b>Главное:</b>\n{summary}")
+            msg_parts.append(f"\n💡 <b>Главное:</b>\n{html.escape(summary)}")
 
         if timeline:
-            msg_parts.append(f"\n⏳ <b>Хронология / Таймлайн:</b>\n{timeline}")
+            msg_parts.append(f"\n⏳ <b>Хронология / Таймлайн:</b>\n{html.escape(timeline)}")
 
         if people_list:
-            people_names = [p["name"] for p in people_list]
+            people_names = [html.escape(p["name"]) for p in people_list]
             msg_parts.append(f"\n👥 <b>Люди в CRM:</b> {', '.join(people_names)}")
 
         if created_tasks:
@@ -306,24 +307,34 @@ async def handle_text_note(message: types.Message):
             for idx, task in enumerate(created_tasks, 1):
                 due_info = format_datetime_human(task.due_date)
                 remind_info = f", напомню {format_datetime_human(task.remind_at)}" if task.remind_at else ""
-                msg_parts.append(f"{idx}. <b>{task.title}</b>\n   └ <i>Срок: {due_info}{remind_info}</i>")
+                msg_parts.append(f"{idx}. <b>{html.escape(task.title)}</b>\n   └ <i>Срок: {due_info}{remind_info}</i>")
 
         if matched_link:
             msg_parts.append(
-                f"\n🔮 <b>Неочевидная связь:</b>\n{matched_link['insight']}\n"
-                f"<i>(перекликается с «{matched_link['matched_note_title']}»)</i>"
+                f"\n🔮 <b>Неочевидная связь:</b>\n{html.escape(matched_link['insight'])}\n"
+                f"<i>(перекликается с «{html.escape(matched_link['matched_note_title'])}»)</i>"
             )
 
-        msg_parts.append(f"\n─────────────\n⚙️ <i>LLM: {model_used}</i>")
+        msg_parts.append(f"\n─────────────\n⚙️ <i>LLM: {html.escape(model_used)}</i>")
 
         reply_markup = get_note_created_keyboard(note.id, created_tasks, matched_note=matched_link)
 
-        await status_msg.edit_text(
-            "\n".join(msg_parts),
-            parse_mode="HTML",
-            reply_markup=reply_markup
-        )
+        try:
+            await status_msg.edit_text(
+                "\n".join(msg_parts),
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        except Exception:
+            await status_msg.edit_text(
+                "\n".join(msg_parts),
+                parse_mode=None,
+                reply_markup=reply_markup
+            )
 
     except Exception as e:
         logger.exception(f"Ошибка при обработке текстовой заметки: {e}")
-        await status_msg.edit_text(f"⚠️ Ошибка при обработке заметки: {e}")
+        try:
+            await status_msg.edit_text(f"⚠️ Ошибка при обработке заметки: {e}")
+        except Exception:
+            pass

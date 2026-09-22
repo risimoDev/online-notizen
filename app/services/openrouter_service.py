@@ -13,6 +13,49 @@ logger = logging.getLogger(__name__)
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 
 
+def _clean_str(val: Any, default: str = "") -> str:
+    """Безопасно преобразует любое значение (строку, список, число, словарь) в очищенную строку."""
+    if val is None:
+        return default
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, (list, tuple)):
+        items = [_clean_str(x) for x in val if x is not None]
+        items = [x for x in items if x]
+        if items:
+            return "\n".join(f"• {x}" if not x.startswith("•") and not x.startswith("-") else x for x in items)
+        return default
+    if isinstance(val, dict):
+        return json.dumps(val, ensure_ascii=False)
+    return str(val).strip()
+
+
+def _clean_str_or_none(val: Any) -> Optional[str]:
+    res = _clean_str(val, default="")
+    return res if res else None
+
+
+def _clean_tags(val: Any) -> List[str]:
+    """Преобразует строку, список или None в чистый список тегов."""
+    if not val:
+        return []
+    if isinstance(val, str):
+        return [t.strip().lstrip("#") for t in val.replace(";", ",").split(",") if t.strip()]
+    if isinstance(val, (list, tuple)):
+        clean = []
+        for item in val:
+            if isinstance(item, str):
+                t = item.strip().lstrip("#")
+                if t:
+                    clean.append(t)
+            elif item is not None:
+                s = str(item).strip().lstrip("#")
+                if s:
+                    clean.append(s)
+        return clean
+    return []
+
+
 class OpenRouterService:
     def __init__(self):
         self.api_key = settings.openrouter_api_key
@@ -289,52 +332,75 @@ class OpenRouterService:
 
         try:
             data = json.loads(clean_json)
-        except json.JSONDecodeError:
+        except Exception:
             # Попробуем извлечь JSON регуляркой
             match = re.search(r"\{[\s\S]*\}", clean_json)
             if match:
-                data = json.loads(match.group(0))
+                try:
+                    data = json.loads(match.group(0))
+                except Exception:
+                    data = {}
             else:
                 logger.error(f"Не удалось распарсить JSON от модели {model_used}: {content}")
-                data = {
-                    "title": raw_text[:50] + ("..." if len(raw_text) > 50 else ""),
-                    "summary": raw_text,
-                    "timeline": None,
-                    "tasks": [],
-                    "tags": ["заметка"],
-                    "people": []
-                }
+                data = {}
+
+        if not isinstance(data, dict):
+            data = {}
+
+        # Безопасная нормализация заголовка
+        title = _clean_str(data.get("title"))
+        if not title:
+            title = raw_text[:50] + ("..." if len(raw_text) > 50 else "")
+
+        # Безопасная нормализация summary, timeline и tags
+        summary = _clean_str(data.get("summary"), default=raw_text)
+        timeline = _clean_str_or_none(data.get("timeline"))
+        tags = _clean_tags(data.get("tags"))
+        if not tags:
+            tags = ["заметка"]
 
         # Валидация и парсинг дат в задачах
         tasks_list = []
-        for t in data.get("tasks", []):
-            if isinstance(t, dict) and t.get("title"):
-                due_dt = parse_datetime_yekt(t.get("due_date"))
-                tasks_list.append({
-                    "title": t.get("title", "").strip(),
-                    "due_date": due_dt,
-                    "priority": t.get("priority", "medium") if t.get("priority") in ("low", "medium", "high") else "medium"
-                })
+        tasks_raw = data.get("tasks", [])
+        if isinstance(tasks_raw, list):
+            for t in tasks_raw:
+                if isinstance(t, dict):
+                    t_title = _clean_str(t.get("title"))
+                    if t_title:
+                        due_raw = t.get("due_date")
+                        due_dt = parse_datetime_yekt(due_raw) if isinstance(due_raw, str) else None
+                        priority = str(t.get("priority", "medium")).lower().strip()
+                        if priority not in ("low", "medium", "high"):
+                            priority = "medium"
+                        tasks_list.append({
+                            "title": t_title,
+                            "due_date": due_dt,
+                            "priority": priority
+                        })
 
         # Обработка людей
         people_list = []
-        for p in data.get("people", []):
-            if isinstance(p, dict) and p.get("name") and len(p.get("name", "").strip()) >= 2:
-                people_list.append({
-                    "name": p.get("name", "").strip(),
-                    "role": p.get("role"),
-                    "facts": p.get("facts"),
-                    "agreements": p.get("agreements"),
-                    "birthday": p.get("birthday"),
-                    "contact_info": p.get("contact_info")
-                })
+        people_raw = data.get("people", [])
+        if isinstance(people_raw, list):
+            for p in people_raw:
+                if isinstance(p, dict):
+                    p_name = _clean_str(p.get("name"))
+                    if len(p_name) >= 2:
+                        people_list.append({
+                            "name": p_name,
+                            "role": _clean_str_or_none(p.get("role")),
+                            "facts": _clean_str_or_none(p.get("facts")),
+                            "agreements": _clean_str_or_none(p.get("agreements")),
+                            "birthday": _clean_str_or_none(p.get("birthday")),
+                            "contact_info": _clean_str_or_none(p.get("contact_info"))
+                        })
 
         return {
-            "title": data.get("title", "Заметка").strip(),
-            "summary": data.get("summary", "").strip(),
-            "timeline": data.get("timeline"),
+            "title": title,
+            "summary": summary,
+            "timeline": timeline,
             "tasks": tasks_list,
-            "tags": data.get("tags", []),
+            "tags": tags,
             "people": people_list,
             "model_used": model_used
         }
@@ -445,12 +511,18 @@ class OpenRouterService:
                 clean = clean.split("```")[1].split("```")[0].strip()
             
             data = json.loads(clean)
-            if data.get("matched_note_id") and data.get("insight"):
-                return {
-                    "matched_note_id": int(data["matched_note_id"]),
-                    "matched_note_title": data.get("matched_note_title", "Заметка"),
-                    "insight": data["insight"].strip()
-                }
+            if isinstance(data, dict):
+                matched_id = data.get("matched_note_id")
+                insight = _clean_str(data.get("insight"))
+                if matched_id is not None and insight:
+                    try:
+                        return {
+                            "matched_note_id": int(matched_id),
+                            "matched_note_title": _clean_str(data.get("matched_note_title"), "Заметка"),
+                            "insight": insight
+                        }
+                    except (ValueError, TypeError):
+                        pass
         except Exception as e:
             logger.warning(f"Serendipity Engine exception: {e}")
         return None
@@ -530,8 +602,22 @@ class OpenRouterService:
                 clean = clean.split("```json")[1].split("```")[0].strip()
             elif "```" in clean:
                 clean = clean.split("```")[1].split("```")[0].strip()
-            data = json.loads(clean)
+
+            try:
+                data = json.loads(clean)
+            except Exception:
+                match = re.search(r"\{[\s\S]*\}", clean)
+                data = json.loads(match.group(0)) if match else {}
+
+            if not isinstance(data, dict):
+                data = {}
+
             data["model_used"] = model_used
+            data["overview"] = _clean_str(data.get("overview"), "План на сегодня сформирован.")
+            if not isinstance(data.get("schedule_blocks"), list):
+                data["schedule_blocks"] = []
+            if not isinstance(data.get("task_timings"), list):
+                data["task_timings"] = []
             return data
         except Exception as e:
             logger.error(f"Ошибка в Day Planner: {e}")
@@ -611,19 +697,63 @@ class OpenRouterService:
         except Exception:
             match = re.search(r"\{[\s\S]*\}", clean)
             if match:
-                data = json.loads(match.group(0))
+                try:
+                    data = json.loads(match.group(0))
+                except Exception:
+                    data = {}
             else:
-                data = {
-                    "topic": "Протокол встречи",
-                    "participants": [],
-                    "timeline": [],
-                    "decisions": [],
-                    "action_items": [],
-                    "unresolved": []
-                }
+                data = {}
 
-        data["model_used"] = model_used
-        return data
+        if not isinstance(data, dict):
+            data = {}
+
+        topic = _clean_str(data.get("topic"), "Протокол встречи")
+        participants = []
+        if isinstance(data.get("participants"), list):
+            participants = [_clean_str(p) for p in data.get("participants") if _clean_str(p)]
+        elif isinstance(data.get("participants"), str):
+            participants = [_clean_str(p) for p in data.get("participants").split(",") if _clean_str(p)]
+
+        timeline = []
+        if isinstance(data.get("timeline"), list):
+            timeline = [_clean_str(tl) for tl in data.get("timeline") if _clean_str(tl)]
+        elif isinstance(data.get("timeline"), str):
+            timeline = [_clean_str(tl) for tl in data.get("timeline").split("\n") if _clean_str(tl)]
+
+        decisions = []
+        if isinstance(data.get("decisions"), list):
+            decisions = [_clean_str(d) for d in data.get("decisions") if _clean_str(d)]
+        elif isinstance(data.get("decisions"), str):
+            decisions = [_clean_str(d) for d in data.get("decisions").split("\n") if _clean_str(d)]
+
+        unresolved = []
+        if isinstance(data.get("unresolved"), list):
+            unresolved = [_clean_str(u) for u in data.get("unresolved") if _clean_str(u)]
+        elif isinstance(data.get("unresolved"), str):
+            unresolved = [_clean_str(u) for u in data.get("unresolved").split("\n") if _clean_str(u)]
+
+        action_items = []
+        if isinstance(data.get("action_items"), list):
+            for ai in data.get("action_items"):
+                if isinstance(ai, dict):
+                    t = _clean_str(ai.get("task"))
+                    if t:
+                        action_items.append({
+                            "task": t,
+                            "assignee": _clean_str(ai.get("assignee"), "Не назначен"),
+                            "due_date": ai.get("due_date"),
+                            "priority": ai.get("priority", "medium")
+                        })
+
+        return {
+            "topic": topic,
+            "participants": participants,
+            "timeline": timeline,
+            "decisions": decisions,
+            "action_items": action_items,
+            "unresolved": unresolved,
+            "model_used": model_used
+        }
 
 
 # Экземпляр сервиса

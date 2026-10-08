@@ -6,15 +6,19 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 from aiogram import Bot
+from aiogram.exceptions import TelegramForbiddenError
 
 from app.config import settings
 from app.utils.date_utils import get_now_yekt, get_tz, format_datetime_human
 from app.database.session import (
     get_due_reminders,
     mark_task_reminded,
-    get_user_tasks
+    get_user_tasks,
+    get_user_ids_with_pending_tasks
 )
+from app.services.access_service import access_service
 from app.utils.keyboards import get_reminder_action_keyboard
+from app.utils.text import esc, split_message
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +47,8 @@ class SchedulerService:
                 self.send_morning_briefing,
                 trigger=CronTrigger(hour=m_h, minute=m_m, timezone=get_tz()),
                 id="morning_briefing",
+                misfire_grace_time=1800,  # не пропускать запуск, если бот был занят в назначенную секунду
+                coalesce=True,
                 replace_existing=True
             )
             logger.info(f"Утренний брифинг запланирован на {settings.morning_briefing_time} YEKT")
@@ -56,6 +62,8 @@ class SchedulerService:
                 self.send_evening_review,
                 trigger=CronTrigger(hour=e_h, minute=e_m, timezone=get_tz()),
                 id="evening_review",
+                misfire_grace_time=1800,  # не пропускать запуск, если бот был занят в назначенную секунду
+                coalesce=True,
                 replace_existing=True
             )
             logger.info(f"Вечерний отчет запланирован на {settings.evening_briefing_time} YEKT")
@@ -68,6 +76,8 @@ class SchedulerService:
                 self.run_scheduled_backup,
                 trigger=CronTrigger(day_of_week="sun", hour=3, minute=0, timezone=get_tz()),
                 id="weekly_backup",
+                misfire_grace_time=1800,  # не пропускать запуск, если бот был занят в назначенную секунду
+                coalesce=True,
                 replace_existing=True
             )
             logger.info("Еженедельный бэкап базы данных запланирован на вс 03:00 YEKT")
@@ -93,14 +103,18 @@ class SchedulerService:
         due_tasks = await get_due_reminders(now)
 
         for task in due_tasks:
+            # Пользователь лишен доступа — не беспокоим его
+            if not access_service.is_allowed(task.user_id):
+                await mark_task_reminded(task.id)
+                continue
             try:
                 text = (
                     f"⏰ <b>НАПОМИНАНИЕ!</b>\n\n"
-                    f"📌 <b>Задача:</b> {task.title}\n"
+                    f"📌 <b>Задача:</b> {esc(task.title)}\n"
                     f"⏳ <b>Срок:</b> {format_datetime_human(task.due_date)}\n"
                 )
                 if task.note:
-                    text += f"📝 <i>Из заметки: {task.note.title}</i>\n"
+                    text += f"📝 <i>Из заметки: {esc(task.note.title)}</i>\n"
 
                 keyboard = get_reminder_action_keyboard(task.id)
                 
@@ -112,20 +126,31 @@ class SchedulerService:
                 )
                 await mark_task_reminded(task.id)
                 logger.info(f"Отправлено напоминание для задачи #{task.id} пользователю {task.user_id}")
+            except TelegramForbiddenError:
+                # Пользователь заблокировал бота — иначе бот повторял бы попытку каждые 30 секунд
+                logger.warning(f"Пользователь {task.user_id} заблокировал бота, напоминание #{task.id} пропущено.")
+                await mark_task_reminded(task.id)
             except Exception as e:
                 logger.error(f"Ошибка при отправке напоминания #{task.id}: {e}")
+
+    async def _briefing_recipients(self):
+        """Пользователи с активными задачами, у которых есть доступ к боту."""
+        user_ids = await get_user_ids_with_pending_tasks()
+        return [uid for uid in user_ids if access_service.is_allowed(uid)]
+
+    async def _send_html(self, user_id: int, text: str):
+        for chunk in split_message(text):
+            await self.bot.send_message(chat_id=user_id, text=chunk, parse_mode="HTML")
 
     async def send_morning_briefing(self):
         """Рассылка утреннего брифинга с задачами на сегодня."""
         if not self.bot:
             return
 
-        users = settings.allowed_telegram_ids
         now = get_now_yekt()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_end = now.replace(hour=23, minute=59, standing=False if hasattr(now, 'standing') else 59, microsecond=999999)
+        today_end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
 
-        for user_id in users:
+        for user_id in await self._briefing_recipients():
             try:
                 # Получаем активные задачи на сегодня + просроченные
                 tasks = await get_user_tasks(user_id=user_id, status="pending", date_to=today_end)
@@ -139,15 +164,13 @@ class SchedulerService:
 
                 for i, t in enumerate(tasks, 1):
                     time_str = t.due_date.strftime("%H:%M") if t.due_date else "Без точного времени"
-                    msg_lines.append(f"{i}. <b>[{time_str}]</b> {t.title}")
+                    if t.due_date and t.due_date < now:
+                        time_str = f"просрочено, {t.due_date.strftime('%d.%m %H:%M')}"
+                    msg_lines.append(f"{i}. <b>[{time_str}]</b> {esc(t.title)}")
 
                 msg_lines.append("\nЖелаю продуктивного дня! 💪\n/tasks — открыть управление задачами")
-                
-                await self.bot.send_message(
-                    chat_id=user_id,
-                    text="\n".join(msg_lines),
-                    parse_mode="HTML"
-                )
+
+                await self._send_html(user_id, "\n".join(msg_lines))
             except Exception as e:
                 logger.error(f"Ошибка утреннего брифинга для {user_id}: {e}")
 
@@ -156,9 +179,8 @@ class SchedulerService:
         if not self.bot:
             return
 
-        users = settings.allowed_telegram_ids
         now = get_now_yekt()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        users = set(await self._briefing_recipients()) | access_service.recipient_ids()
 
         for user_id in users:
             try:
@@ -172,16 +194,12 @@ class SchedulerService:
                 if overdue_tasks:
                     msg_lines.append(f"\n⚠️ <b>Остались не завершены ({len(overdue_tasks)}):</b>")
                     for t in overdue_tasks[:5]:
-                        msg_lines.append(f"• {t.title}")
+                        msg_lines.append(f"• {esc(t.title)}")
                     msg_lines.append("\nВы можете перенести или закрыть их в списке: /tasks")
                 else:
                     msg_lines.append("\n🎉 Все запланированные дела на сегодня закрыты! Отличная работа!")
 
-                await self.bot.send_message(
-                    chat_id=user_id,
-                    text="\n".join(msg_lines),
-                    parse_mode="HTML"
-                )
+                await self._send_html(user_id, "\n".join(msg_lines))
             except Exception as e:
                 logger.error(f"Ошибка вечернего отчета для {user_id}: {e}")
 

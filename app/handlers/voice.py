@@ -1,16 +1,23 @@
-import os
 import html
 import logging
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from aiogram import Router, types, F
 from aiogram.enums import ChatAction
+from aiogram.types import BufferedInputFile
 
-from app.services.stt_service import stt_service
+from app.services.stt_service import stt_service, STT_EMPTY_RESULT
 from app.services.openrouter_service import ai_service
-from app.database.session import create_note_with_tasks
-from app.utils.date_utils import format_datetime_human
+from app.database.session import (
+    create_note_with_tasks,
+    get_user_notes,
+    upsert_contact_from_ai
+)
+from app.utils.date_utils import format_datetime_human, get_now_yekt
 from app.utils.keyboards import get_note_created_keyboard
+from app.utils.text import send_long_html
 
 logger = logging.getLogger(__name__)
 
@@ -19,38 +26,116 @@ router = Router()
 TEMP_DIR = Path("temp_audio")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+# Bot API позволяет боту скачивать файлы не больше 20 МБ
+TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+# Расшифровки длиннее этого порога дополнительно присылаются файлом
+TRANSCRIPT_FILE_THRESHOLD = 1500
+
+AUDIO_EXTENSIONS = {
+    "mp3", "m4a", "wav", "ogg", "oga", "opus", "flac", "aac", "wma", "amr",
+    "webm", "mp4", "mpeg", "mpga", "mkv", "mov"
+}
+MEETING_MARKERS = ("/meeting", "#встреча", "#совещание")
+
+
+@dataclass
+class MediaInfo:
+    file_id: str
+    ext: str
+    duration: Optional[int]
+    file_size: Optional[int]
+
+
+def _ext_from_name(file_name: Optional[str], default: str) -> str:
+    if file_name and "." in file_name:
+        return file_name.rsplit(".", 1)[-1].lower()
+    return default
+
+
+def extract_media(message: types.Message) -> Optional[MediaInfo]:
+    """
+    Достает из сообщения голосовое, аудио, кружочек, видео или аудио/видео-файл,
+    отправленный документом (так Telegram часто присылает .m4a/.wav).
+    """
+    if message.voice:
+        v = message.voice
+        return MediaInfo(v.file_id, "ogg", v.duration, v.file_size)
+    if message.audio:
+        a = message.audio
+        return MediaInfo(a.file_id, _ext_from_name(a.file_name, "mp3"), a.duration, a.file_size)
+    if message.video_note:
+        v = message.video_note
+        return MediaInfo(v.file_id, "mp4", v.duration, v.file_size)
+    if message.video:
+        v = message.video
+        return MediaInfo(v.file_id, _ext_from_name(v.file_name, "mp4"), v.duration, v.file_size)
+    if message.document:
+        d = message.document
+        mime = (d.mime_type or "").lower()
+        ext = _ext_from_name(d.file_name, "")
+        if mime.startswith(("audio/", "video/")) or ext in AUDIO_EXTENSIONS:
+            return MediaInfo(d.file_id, ext or "bin", None, d.file_size)
+    return None
+
+
+def is_meeting_caption(message: types.Message) -> bool:
+    caption = (message.caption or "").lower()
+    return any(marker in caption for marker in MEETING_MARKERS)
+
+
+def transcript_file(raw_text: str, title: str = "Transcript") -> BufferedInputFile:
+    stamp = get_now_yekt().strftime("%Y%m%d_%H%M")
+    safe_title = "".join(c for c in title if c.isalnum() or c in " _-")[:30].strip() or "Transcript"
+    return BufferedInputFile(raw_text.encode("utf-8"), filename=f"{safe_title}_{stamp}.txt")
+
 
 async def process_audio_file(
     message: types.Message,
-    file_id: str,
-    file_ext: str,
-    duration: Optional[int] = None
+    media: MediaInfo,
+    meeting_mode: bool = False
 ):
     user_id = message.from_user.id
-    status_msg = await message.reply("🎙 <i>Слушаю и расшифровываю голосовое сообщение...</i>", parse_mode="HTML")
-    
-    temp_path = TEMP_DIR / f"{file_id}.{file_ext}"
+    duration = media.duration
+
+    if media.file_size and media.file_size > TELEGRAM_DOWNLOAD_LIMIT:
+        size_mb = media.file_size / 1024 / 1024
+        await message.reply(
+            f"⚠️ Файл весит {size_mb:.1f} МБ, а Telegram разрешает ботам скачивать файлы не больше 20 МБ.\n\n"
+            "Сожмите запись (в моно 32 кбит/с час разговора занимает ~15 МБ):\n"
+            "<code>ffmpeg -i input.m4a -ac 1 -b:a 32k output.mp3</code>\n"
+            "или разделите её на части.",
+            parse_mode="HTML"
+        )
+        return
+
+    long_hint = ""
+    if (duration and duration > 300) or (media.file_size and media.file_size > 3 * 1024 * 1024):
+        long_hint = "\n<i>Запись длинная — расшифровка может занять несколько минут.</i>"
+    status_msg = await message.reply(f"🎙 <i>Слушаю и расшифровываю аудио...</i>{long_hint}", parse_mode="HTML")
+
+    temp_path = TEMP_DIR / f"{uuid.uuid4().hex}.{media.ext}"
 
     try:
         await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-        
+
         # 1. Скачиваем аудиофайл из Telegram
-        file = await message.bot.get_file(file_id)
-        await message.bot.download_file(file.file_path, destination=temp_path)
+        file = await message.bot.get_file(media.file_id)
+        await message.bot.download_file(file.file_path, destination=temp_path, timeout=300)
 
         # 2. Транскрибируем аудио
         raw_text, stt_engine = await stt_service.transcribe_audio(temp_path)
 
-        if not raw_text or raw_text == "Не удалось разобрать речь в аудиосообщении.":
+        if not raw_text or raw_text == STT_EMPTY_RESULT:
             await status_msg.edit_text("❌ Не удалось распознать речь в этом аудиосообщении.")
             return
 
-        # Проверяем, не запрошен ли режим протокола встречи
-        caption = (message.caption or "").lower()
-        if "/meeting" in caption or "#встреча" in caption or "#совещание" in caption:
+        # Режим протокола встречи: команда /meeting или #встреча в подписи
+        if meeting_mode or is_meeting_caption(message):
             await status_msg.delete()
             from app.handlers.meeting import process_meeting_transcript
-            await process_meeting_transcript(message, raw_text)
+            await process_meeting_transcript(
+                message, raw_text, stt_engine=stt_engine, duration_seconds=duration
+            )
             return
 
         # Обновляем статус
@@ -87,7 +172,6 @@ async def process_audio_file(
         # 5. Сохранение людей в CRM
         for p in people_list:
             try:
-                from app.database.session import upsert_contact_from_ai
                 await upsert_contact_from_ai(user_id=user_id, person_data=p, note_id=note.id)
             except Exception as pe:
                 logger.warning(f"Ошибка сохранения контакта в CRM: {pe}")
@@ -95,7 +179,6 @@ async def process_audio_file(
         # 6. Поиск связей (Serendipity Engine)
         matched_link = None
         try:
-            from app.database.session import get_user_notes
             past_notes = await get_user_notes(user_id=user_id, limit=8)
             past_candidates = [
                 {
@@ -118,7 +201,7 @@ async def process_audio_file(
 
         # 7. Формирование красивого ответа с экранированием HTML
         tags_line = " ".join([f"#{html.escape(str(t).strip())}" for t in tags if str(t).strip()])
-        
+
         msg_parts = [
             f"📝 <b>{html.escape(title)}</b>",
         ]
@@ -156,24 +239,18 @@ async def process_audio_file(
         msg_parts.append(f"\n─────────────\n⚙️ <i>STT: {html.escape(stt_engine)} | LLM: {html.escape(model_used)}</i>")
 
         reply_markup = get_note_created_keyboard(note.id, created_tasks, matched_note=matched_link)
+        await send_long_html(message, "\n".join(msg_parts), reply_markup=reply_markup, edit_message=status_msg)
 
-        try:
-            await status_msg.edit_text(
-                "\n".join(msg_parts),
-                parse_mode="HTML",
-                reply_markup=reply_markup
-            )
-        except Exception:
-            await status_msg.edit_text(
-                "\n".join(msg_parts),
-                parse_mode=None,
-                reply_markup=reply_markup
+        if len(raw_text) > TRANSCRIPT_FILE_THRESHOLD:
+            await message.answer_document(
+                document=transcript_file(raw_text, title),
+                caption="🗣 Полная расшифровка"
             )
 
     except Exception as e:
         logger.exception(f"Ошибка при обработке голосового сообщения: {e}")
         try:
-            await status_msg.edit_text(f"⚠️ Произошла ошибка при обработке: {e}")
+            await status_msg.edit_text(f"⚠️ Произошла ошибка при обработке: {html.escape(str(e))}")
         except Exception:
             pass
     finally:
@@ -185,38 +262,11 @@ async def process_audio_file(
                 pass
 
 
-@router.message(F.voice)
-async def handle_voice_message(message: types.Message):
-    """Обработка стандартных голосовых сообщений."""
-    voice = message.voice
-    await process_audio_file(
-        message=message,
-        file_id=voice.file_id,
-        file_ext="ogg",
-        duration=voice.duration
-    )
-
-
-@router.message(F.audio)
-async def handle_audio_message(message: types.Message):
-    """Обработка переданных аудиозаписей (.mp3, .m4a, .wav и т.д.)."""
-    audio = message.audio
-    ext = audio.file_name.split(".")[-1] if audio.file_name and "." in audio.file_name else "mp3"
-    await process_audio_file(
-        message=message,
-        file_id=audio.file_id,
-        file_ext=ext,
-        duration=audio.duration
-    )
-
-
-@router.message(F.video_note)
-async def handle_video_note_message(message: types.Message):
-    """Обработка видеосообщений (кружочков)."""
-    vnote = message.video_note
-    await process_audio_file(
-        message=message,
-        file_id=vnote.file_id,
-        file_ext="mp4",
-        duration=vnote.duration
-    )
+@router.message(F.voice | F.audio | F.video_note | F.video | F.document)
+async def handle_media_message(message: types.Message):
+    """Голосовые, аудиофайлы (.mp3, .m4a, .wav...), кружочки, видео и аудио, присланные файлом."""
+    media = extract_media(message)
+    if media is None:
+        await message.reply("📎 Я умею обрабатывать только аудио и видео. Текст можно просто отправить сообщением.")
+        return
+    await process_audio_file(message, media)

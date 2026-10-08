@@ -4,14 +4,24 @@ from aiogram.filters import CommandStart, Command
 from app.config import settings
 from app.utils.date_utils import get_now_yekt
 from app.services.openrouter_service import ai_service
-from app.database.session import get_user_tasks, get_user_notes
+from app.database.session import get_user_tasks, count_user_notes
+from app.services.access_service import access_service
+from app.utils.text import esc
 
 router = Router()
 
+ADMIN_HELP = (
+    "\n\n👑 <b>Администрирование:</b>\n"
+    "• <code>/users</code> — кто имеет доступ к боту\n"
+    "• <code>/adduser</code> — выдать доступ (выбор из контактов, по ID или ответом на пересланное сообщение)\n"
+    "• <code>/deluser &lt;id&gt;</code> — отозвать доступ\n"
+    "• <code>/backup</code> — скачать копию базы данных"
+)
+
 
 @router.message(CommandStart())
-async def cmd_start(message: types.Message):
-    user_name = message.from_user.first_name or "друг"
+async def cmd_start(message: types.Message, is_admin: bool = False):
+    user_name = esc(message.from_user.first_name or "друг")
     now = get_now_yekt()
     now_str = now.strftime("%d.%m.%Y %H:%M")
 
@@ -33,15 +43,16 @@ async def cmd_start(message: types.Message):
         f"• /meeting — режим протоколов совещаний (с экспортом в .md)\n"
         f"• /search &lt;запрос&gt; — поиск заметок\n"
         f"• /ask &lt;вопрос&gt; — умный ответ ИИ по твоим записям (RAG)\n"
-        f"• /backup — мгновенная выгрузка базы данных в чат\n"
         f"• /status — статус системы и модели\n\n"
         f"<i>Просто запиши голосовое или напиши текст прямо сюда!</i>"
     )
+    if is_admin:
+        text += ADMIN_HELP
     await message.answer(text, parse_mode="HTML")
 
 
 @router.message(Command("help"))
-async def cmd_help(message: types.Message):
+async def cmd_help(message: types.Message, is_admin: bool = False):
     text = (
         f"📖 <b>Справка по командам ассистента:</b>\n\n"
         f"🔹 <b>Создание заметок и задач:</b>\n"
@@ -62,20 +73,21 @@ async def cmd_help(message: types.Message):
         f"• <code>/ask &lt;вопрос&gt;</code> — ИИ-ответ по вашей личной базе (RAG)\n\n"
         f"🔹 <b>Специальные инструменты:</b>\n"
         f"• <code>/meeting</code> — составить протокол совещания и скачать .md\n"
-        f"• <code>/backup</code> — скачать свежую копию базы данных SQLite\n"
         f"• <code>/status</code> — статус моделей, сервера и задач"
     )
+    if is_admin:
+        text += ADMIN_HELP
     await message.answer(text, parse_mode="HTML")
 
 
 @router.message(Command("status"))
-async def cmd_status(message: types.Message):
+async def cmd_status(message: types.Message, is_admin: bool = False):
     user_id = message.from_user.id
     now = get_now_yekt()
-    
+
     # Статистика из БД
     tasks = await get_user_tasks(user_id=user_id, status="pending")
-    notes = await get_user_notes(user_id=user_id, limit=5)
+    notes_count = await count_user_notes(user_id=user_id)
     
     # Информация об ИИ моделях
     models = await ai_service.get_ordered_free_models()
@@ -94,6 +106,9 @@ async def cmd_status(message: types.Message):
         f"🌙 <b>Вечерний отчет:</b> {settings.evening_briefing_time} YEKT\n\n"
         f"📊 <b>Ваша статистика:</b>\n"
         f"• Активных задач: {len(tasks)}\n"
-        f"• Заметок: {len(notes)}"
+        f"• Заметок: {notes_count}"
     )
+    if is_admin:
+        users_count = len(access_service.recipient_ids() - access_service.admin_ids)
+        text += f"\n\n👑 <b>Доступ:</b> администраторов {len(access_service.admin_ids)}, пользователей {users_count}"
     await message.answer(text, parse_mode="HTML")

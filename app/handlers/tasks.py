@@ -20,6 +20,7 @@ from app.utils.keyboards import (
     get_task_item_keyboard,
     get_task_timing_presets_keyboard
 )
+from app.utils.text import esc, send_long_html
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ async def cmd_tasks(message: types.Message):
 
     for idx, t in enumerate(tasks, 1):
         due_str = format_datetime_human(t.due_date)
-        text_lines.append(f"{idx}. <b>{t.title}</b>\n   └ <i>{due_str}</i>")
+        text_lines.append(f"{idx}. <b>{esc(t.title)}</b>\n   └ <i>{due_str}</i>")
         builder.row(
             types.InlineKeyboardButton(
                 text=f"⚙️ {idx}. {t.title[:25]}",
@@ -49,9 +50,9 @@ async def cmd_tasks(message: types.Message):
             )
         )
 
-    await message.answer(
+    await send_long_html(
+        message,
         "\n".join(text_lines) + "\n\n<i>Нажмите на кнопку задачи для управления или отметки о выполнении:</i>",
-        parse_mode="HTML",
         reply_markup=builder.as_markup()
     )
 
@@ -74,7 +75,7 @@ async def cmd_today(message: types.Message):
 
     for idx, t in enumerate(tasks, 1):
         due_str = format_datetime_human(t.due_date)
-        text_lines.append(f"{idx}. <b>{t.title}</b> ({due_str})")
+        text_lines.append(f"{idx}. <b>{esc(t.title)}</b> ({due_str})")
         builder.row(
             types.InlineKeyboardButton(
                 text=f"✅ {idx}. {t.title[:25]}",
@@ -82,11 +83,7 @@ async def cmd_today(message: types.Message):
             )
         )
 
-    await message.answer(
-        "\n".join(text_lines),
-        parse_mode="HTML",
-        reply_markup=builder.as_markup()
-    )
+    await send_long_html(message, "\n".join(text_lines), reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data.startswith("task_view:"))
@@ -104,13 +101,13 @@ async def cb_task_view(callback: types.CallbackQuery):
     remind_str = format_datetime_human(task.remind_at) if task.remind_at else "Не настроено"
 
     text_parts = [
-        f"{status_icon} <b>Задача: {task.title}</b>\n",
+        f"{status_icon} <b>Задача: {esc(task.title)}</b>\n",
         f"📊 <b>Статус:</b> {status_text}",
         f"📅 <b>Срок:</b> {due_str}",
         f"⏰ <b>Напоминание:</b> {remind_str}",
     ]
     if task.note:
-        text_parts.append(f"📝 <b>Заметка:</b> {task.note.title}")
+        text_parts.append(f"📝 <b>Заметка:</b> {esc(task.note.title)}")
 
     keyboard = get_task_item_keyboard(task.id)
     await callback.message.edit_text("\n".join(text_parts), parse_mode="HTML", reply_markup=keyboard)
@@ -129,7 +126,7 @@ async def cb_task_done(callback: types.CallbackQuery):
     await update_task_status(task_id=task_id, status="completed")
     await callback.answer("🎉 Отлично! Задача отмечена как выполненная.")
     await callback.message.edit_text(
-        f"✅ <b>Задача выполнена:</b>\n<s>{task.title}</s>",
+        f"✅ <b>Задача выполнена:</b>\n<s>{esc(task.title)}</s>",
         parse_mode="HTML"
     )
 
@@ -154,7 +151,7 @@ async def cb_task_postpone(callback: types.CallbackQuery):
 
     await callback.answer(f"⏳ Отложено на {minutes} минут.")
     await callback.message.edit_text(
-        f"⏳ <b>Задача отложена:</b> {task.title}\n"
+        f"⏳ <b>Задача отложена:</b> {esc(task.title)}\n"
         f"📅 <b>Новый срок:</b> {format_datetime_human(new_due)}\n"
         f"⏰ <b>Напоминание:</b> {format_datetime_human(new_remind)}",
         parse_mode="HTML"
@@ -178,7 +175,7 @@ async def cb_task_postpone_tomorrow(callback: types.CallbackQuery):
 
     await callback.answer("📅 Перенесено на завтра на 10:00.")
     await callback.message.edit_text(
-        f"📅 <b>Задача перенесена на завтра:</b> {task.title}\n"
+        f"📅 <b>Задача перенесена на завтра:</b> {esc(task.title)}\n"
         f"⏰ <b>Новый срок:</b> {format_datetime_human(tomorrow_10am)}",
         parse_mode="HTML"
     )
@@ -194,7 +191,7 @@ async def cb_task_custom_time(callback: types.CallbackQuery):
 
     keyboard = get_task_timing_presets_keyboard(task_id)
     await callback.message.edit_text(
-        f"✏️ <b>Выберите новое время для задачи:</b>\n«{task.title}»",
+        f"✏️ <b>Выберите новое время для задачи:</b>\n«{esc(task.title)}»",
         parse_mode="HTML",
         reply_markup=keyboard
     )
@@ -228,7 +225,7 @@ async def cb_task_set_fixed(callback: types.CallbackQuery):
 
     await callback.answer("Время успешно обновлено!")
     await callback.message.edit_text(
-        f"⏰ <b>Время обновлено:</b> {task.title}\n"
+        f"⏰ <b>Время обновлено:</b> {esc(task.title)}\n"
         f"📅 <b>Срок:</b> {format_datetime_human(target_dt)}",
         parse_mode="HTML"
     )

@@ -1,7 +1,8 @@
 import html
 import logging
+import re
 from aiogram import Router, types, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.enums import ChatAction
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -17,10 +18,29 @@ from app.database.session import (
 )
 from app.utils.date_utils import format_datetime_human
 from app.utils.keyboards import get_note_created_keyboard, get_tasks_list_keyboard
+from app.utils.text import esc, send_long_html
 
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+_STOP_WORDS = {
+    "что", "как", "где", "когда", "какой", "какая", "какие", "какое", "который", "зачем", "почему",
+    "записывал", "записывала", "писал", "писала", "говорил", "говорила", "было", "была", "были",
+    "есть", "этот", "эта", "это", "эти", "про", "для", "мне", "меня", "мой", "моя", "мои", "всё", "все",
+}
+
+
+def _keyword_stems(query: str, max_words: int = 5) -> list:
+    """Грубый стемминг для русского: значимые слова обрезаются до 5 букв («налоги» -> «налог»)."""
+    stems = []
+    for word in re.findall(r"[\w-]+", query.lower()):
+        if len(word) < 4 or word in _STOP_WORDS:
+            continue
+        stem = word[:5] if len(word) > 5 else word
+        if stem not in stems:
+            stems.append(stem)
+    return stems[:max_words]
 
 
 @router.message(Command("notes"))
@@ -39,8 +59,8 @@ async def cmd_notes(message: types.Message):
     for idx, n in enumerate(notes, 1):
         dt_str = n.created_at.strftime("%d.%m %H:%M")
         title_snippet = n.title[:35]
-        tags_str = f" [#{n.tags.replace(',', ' #')}]" if n.tags else ""
-        text_lines.append(f"{idx}. <b>{title_snippet}</b> <i>({dt_str})</i>{tags_str}")
+        tags_str = f" [#{esc(n.tags.replace(', ', ',').replace(',', ' #'))}]" if n.tags else ""
+        text_lines.append(f"{idx}. <b>{esc(title_snippet)}</b> <i>({dt_str})</i>{tags_str}")
         
         builder.row(
             types.InlineKeyboardButton(
@@ -53,9 +73,9 @@ async def cmd_notes(message: types.Message):
 
 
 @router.message(Command("search"))
-async def cmd_search(message: types.Message):
+async def cmd_search(message: types.Message, command: CommandObject):
     """Поиск по тексту заметок."""
-    query = message.text.replace("/search", "").strip()
+    query = (command.args or "").strip()
     if not query:
         await message.answer("Использование: <code>/search &lt;поисковый запрос&gt;</code>\nНапример: <code>/search договор</code>", parse_mode="HTML")
         return
@@ -64,15 +84,15 @@ async def cmd_search(message: types.Message):
     found_notes = await search_notes(user_id=user_id, query=query, limit=10)
 
     if not found_notes:
-        await message.answer(f"🔍 По запросу «{query}» ничего не найдено.")
+        await message.answer(f"🔍 По запросу «{esc(query)}» ничего не найдено.")
         return
 
     builder = InlineKeyboardBuilder()
-    text_lines = [f"🔍 <b>Результаты поиска по запросу «{query}»:</b>\n"]
+    text_lines = [f"🔍 <b>Результаты поиска по запросу «{esc(query)}»:</b>\n"]
 
     for idx, n in enumerate(found_notes, 1):
         dt_str = n.created_at.strftime("%d.%m.%Y")
-        text_lines.append(f"{idx}. <b>{n.title}</b> ({dt_str})")
+        text_lines.append(f"{idx}. <b>{esc(n.title)}</b> ({dt_str})")
         builder.row(
             types.InlineKeyboardButton(
                 text=f"📖 {n.title[:30]}",
@@ -84,9 +104,9 @@ async def cmd_search(message: types.Message):
 
 
 @router.message(Command("ask"))
-async def cmd_ask(message: types.Message):
+async def cmd_ask(message: types.Message, command: CommandObject):
     """Интеллектуальный вопрос ИИ по базе заметок (RAG)."""
-    query = message.text.replace("/ask", "").strip()
+    query = (command.args or "").strip()
     if not query:
         await message.answer(
             "Использование: <code>/ask &lt;ваш вопрос&gt;</code>\n"
@@ -99,13 +119,16 @@ async def cmd_ask(message: types.Message):
     status_msg = await message.reply("🧠 <i>Ищу информацию в ваших заметках и формулирую ответ...</i>", parse_mode="HTML")
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    # 1. Ищем релевантные заметки по ключевым словам + берем свежие
+    # 1. Ищем релевантные заметки по ключевым словам + берем свежие.
+    # Поиск всей фразой вопроса почти никогда ничего не находит, поэтому ищем по основам слов.
     matched_notes = await search_notes(user_id=user_id, query=query, limit=8)
+    for stem in _keyword_stems(query):
+        matched_notes += await search_notes(user_id=user_id, query=stem, limit=5)
     recent_notes = await get_user_notes(user_id=user_id, limit=8)
-    
-    # Объединяем без дубликатов
+
+    # Объединяем без дубликатов, найденные по словам — первыми
     all_notes_dict = {n.id: n for n in (matched_notes + recent_notes)}
-    notes_list = list(all_notes_dict.values())
+    notes_list = list(all_notes_dict.values())[:20]
 
     notes_context = [
         {
@@ -136,11 +159,11 @@ async def cmd_ask(message: types.Message):
             notes_context=notes_context,
             tasks_context=tasks_context
         )
-        reply_text = f"💡 <b>Ответ ассистента:</b>\n\n{answer}\n\n<i>🤖 Модель: {model_used}</i>"
-        await status_msg.edit_text(reply_text, parse_mode="HTML")
+        reply_text = f"💡 <b>Ответ ассистента:</b>\n\n{esc(answer)}\n\n<i>🤖 Модель: {esc(model_used)}</i>"
+        await send_long_html(message, reply_text, edit_message=status_msg)
     except Exception as e:
         logger.exception(f"Ошибка при RAG-поиске: {e}")
-        await status_msg.edit_text(f"⚠️ Не удалось получить ответ от ИИ: {e}")
+        await status_msg.edit_text(f"⚠️ Не удалось получить ответ от ИИ: {esc(e)}")
 
 
 @router.callback_query(F.data.startswith("view_note:"))
@@ -152,31 +175,31 @@ async def cb_view_note(callback: types.CallbackQuery):
         await callback.answer("Заметка не найдена или удалена.", show_alert=True)
         return
 
-    tags_line = f"\n📌 #{note.tags.replace(',', ' #')}" if note.tags else ""
+    tags_line = f"\n📌 #{esc(note.tags.replace(', ', ',').replace(',', ' #'))}" if note.tags else ""
     dt_str = note.created_at.strftime("%d.%m.%Y в %H:%M")
 
     msg_parts = [
-        f"📝 <b>{note.title}</b> ({dt_str}){tags_line}\n"
+        f"📝 <b>{esc(note.title)}</b> ({dt_str}){tags_line}\n"
     ]
 
     if note.summary:
-        msg_parts.append(f"💡 <b>Главное:</b>\n{note.summary}\n")
+        msg_parts.append(f"💡 <b>Главное:</b>\n{esc(note.summary)}\n")
 
     if note.timeline:
-        msg_parts.append(f"⏳ <b>Хронология:</b>\n{note.timeline}\n")
+        msg_parts.append(f"⏳ <b>Хронология:</b>\n{esc(note.timeline)}\n")
 
     if note.tasks:
         msg_parts.append(f"⏰ <b>Задачи ({len(note.tasks)}):</b>")
         for idx, t in enumerate(note.tasks, 1):
             st = "✅" if t.status == "completed" else "📌"
-            msg_parts.append(f"{idx}. {st} {t.title} (срок: {format_datetime_human(t.due_date)})")
+            msg_parts.append(f"{idx}. {st} {esc(t.title)} (срок: {format_datetime_human(t.due_date)})")
         msg_parts.append("")
 
     raw_preview = note.raw_content if len(note.raw_content) <= 500 else note.raw_content[:500] + "..."
-    msg_parts.append(f"📄 <b>Исходный текст:</b>\n<i>«{raw_preview}»</i>")
+    msg_parts.append(f"📄 <b>Исходный текст:</b>\n<i>«{esc(raw_preview)}»</i>")
 
     keyboard = get_note_created_keyboard(note.id, note.tasks)
-    await callback.message.answer("\n".join(msg_parts), parse_mode="HTML", reply_markup=keyboard)
+    await send_long_html(callback.message, "\n".join(msg_parts), reply_markup=keyboard)
     await callback.answer()
 
 
@@ -319,22 +342,17 @@ async def handle_text_note(message: types.Message):
 
         reply_markup = get_note_created_keyboard(note.id, created_tasks, matched_note=matched_link)
 
-        try:
-            await status_msg.edit_text(
-                "\n".join(msg_parts),
-                parse_mode="HTML",
-                reply_markup=reply_markup
-            )
-        except Exception:
-            await status_msg.edit_text(
-                "\n".join(msg_parts),
-                parse_mode=None,
-                reply_markup=reply_markup
-            )
+        await send_long_html(message, "\n".join(msg_parts), reply_markup=reply_markup, edit_message=status_msg)
 
     except Exception as e:
         logger.exception(f"Ошибка при обработке текстовой заметки: {e}")
         try:
-            await status_msg.edit_text(f"⚠️ Ошибка при обработке заметки: {e}")
+            await status_msg.edit_text(f"⚠️ Ошибка при обработке заметки: {esc(e)}")
         except Exception:
             pass
+
+
+@router.message(F.text.startswith("/"))
+async def handle_unknown_command(message: types.Message):
+    """Неизвестные команды раньше молча игнорировались."""
+    await message.answer("🤔 Неизвестная команда. Список команд: /help")

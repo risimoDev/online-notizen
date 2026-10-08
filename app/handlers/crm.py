@@ -1,6 +1,6 @@
 import logging
 from aiogram import Router, types, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.database.session import (
@@ -10,6 +10,7 @@ from app.database.session import (
     delete_contact_by_id
 )
 from app.utils.date_utils import format_datetime_human
+from app.utils.text import esc, send_long_html
 
 logger = logging.getLogger(__name__)
 
@@ -18,22 +19,22 @@ router = Router()
 
 def get_contact_card_text(contact) -> str:
     """Форматирует досье контакта."""
-    lines = [f"👤 <b>{contact.name}</b>"]
+    lines = [f"👤 <b>{esc(contact.name)}</b>"]
     if contact.role_or_company:
-        lines.append(f"💼 <i>{contact.role_or_company}</i>")
+        lines.append(f"💼 <i>{esc(contact.role_or_company)}</i>")
     if contact.contact_info:
-        lines.append(f"📞 Контакты: <code>{contact.contact_info}</code>")
+        lines.append(f"📞 Контакты: <code>{esc(contact.contact_info)}</code>")
     if contact.birthday:
-        lines.append(f"🎂 День рождения: {contact.birthday}")
+        lines.append(f"🎂 День рождения: {esc(contact.birthday)}")
 
     last_dt_str = format_datetime_human(contact.last_interaction)
     lines.append(f"⏱ Последний контакт: {last_dt_str}\n")
 
     if contact.notes_summary:
-        lines.append(f"💡 <b>Ключевые факты:</b>\n{contact.notes_summary}\n")
+        lines.append(f"💡 <b>Ключевые факты:</b>\n{esc(contact.notes_summary)}\n")
 
     if contact.agreements:
-        lines.append(f"🤝 <b>Договоренности и обещания:</b>\n{contact.agreements}\n")
+        lines.append(f"🤝 <b>Договоренности и обещания:</b>\n{esc(contact.agreements)}\n")
 
     return "\n".join(lines)
 
@@ -58,7 +59,7 @@ async def cmd_crm(message: types.Message):
 
     for idx, c in enumerate(contacts, 1):
         role_part = f" ({c.role_or_company[:20]})" if c.role_or_company else ""
-        text_lines.append(f"{idx}. <b>{c.name}</b>{role_part}")
+        text_lines.append(f"{idx}. <b>{esc(c.name)}</b>{esc(role_part)}")
         builder.row(
             types.InlineKeyboardButton(
                 text=f"👤 {idx}. {c.name}{role_part}",
@@ -74,9 +75,9 @@ async def cmd_crm(message: types.Message):
 
 
 @router.message(Command("whois"))
-async def cmd_whois(message: types.Message):
+async def cmd_whois(message: types.Message, command: CommandObject):
     """Моментальное досье на человека: /whois <имя>."""
-    name_query = message.text.replace("/whois", "").strip()
+    name_query = (command.args or "").strip()
     if not name_query:
         await message.answer("Использование: <code>/whois &lt;имя&gt;</code>\nНапример: <code>/whois Андрей</code>", parse_mode="HTML")
         return
@@ -85,7 +86,7 @@ async def cmd_whois(message: types.Message):
     contact = await get_contact_by_name(user_id=user_id, query_name=name_query)
 
     if not contact:
-        await message.answer(f"🔍 В вашей CRM нет информации о человеке «{name_query}».")
+        await message.answer(f"🔍 В вашей CRM нет информации о человеке «{esc(name_query)}».")
         return
 
     builder = InlineKeyboardBuilder()
@@ -94,7 +95,7 @@ async def cmd_whois(message: types.Message):
     )
 
     card_text = get_contact_card_text(contact)
-    await message.answer(card_text, parse_mode="HTML", reply_markup=builder.as_markup())
+    await send_long_html(message, card_text, reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data.startswith("crm_view:"))
@@ -114,7 +115,7 @@ async def cb_crm_view(callback: types.CallbackQuery):
     )
 
     card_text = get_contact_card_text(contact)
-    await callback.message.edit_text(card_text, parse_mode="HTML", reply_markup=builder.as_markup())
+    await send_long_html(callback.message, card_text, reply_markup=builder.as_markup(), edit_message=callback.message)
     await callback.answer()
 
 
@@ -133,7 +134,7 @@ async def cb_crm_back_list(callback: types.CallbackQuery):
 
     for idx, c in enumerate(contacts, 1):
         role_part = f" ({c.role_or_company[:20]})" if c.role_or_company else ""
-        text_lines.append(f"{idx}. <b>{c.name}</b>{role_part}")
+        text_lines.append(f"{idx}. <b>{esc(c.name)}</b>{esc(role_part)}")
         builder.row(
             types.InlineKeyboardButton(
                 text=f"👤 {idx}. {c.name}{role_part}",

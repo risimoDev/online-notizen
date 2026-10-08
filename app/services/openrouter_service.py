@@ -11,6 +11,8 @@ from app.utils.date_utils import get_now_yekt, parse_datetime_yekt
 logger = logging.getLogger(__name__)
 
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+# Стенограммы длиннее этого порога сжимаются по частям перед составлением протокола
+MEETING_CHUNK_CHARS = 30000
 
 
 def _clean_str(val: Any, default: str = "") -> str:
@@ -156,7 +158,8 @@ class OpenRouterService:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.2,
-        max_retries: int = 12
+        max_retries: int = 12,
+        timeout: float = 45.0
     ) -> Tuple[str, str]:
         """
         Выполняет запрос к OpenRouter с автоматической ротацией бесплатных моделей.
@@ -185,7 +188,7 @@ class OpenRouterService:
 
             try:
                 logger.info(f"OpenRouter: попытка запроса к модели {model}...")
-                async with httpx.AsyncClient(timeout=45.0) as client:
+                async with httpx.AsyncClient(timeout=timeout) as client:
                     resp = await client.post(
                         f"{OPENROUTER_API_BASE}/chat/completions",
                         headers=headers,
@@ -196,7 +199,7 @@ class OpenRouterService:
                         data = resp.json()
                         choices = data.get("choices", [])
                         if choices and "message" in choices[0]:
-                            content = choices[0]["message"].get("content", "").strip()
+                            content = (choices[0]["message"].get("content") or "").strip()
                             if content:
                                 logger.info(f"OpenRouter: успех с моделью {model}")
                                 return content, model
@@ -220,8 +223,9 @@ class OpenRouterService:
                         self.mark_model_cooldown(model, 300)
                         attempts += 1
 
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as e:
                 logger.warning(f"Таймаут запроса к модели {model}")
+                last_error = e
                 self.mark_model_cooldown(model, 120)
                 attempts += 1
             except Exception as e:
@@ -319,7 +323,9 @@ class OpenRouterService:
             {"role": "user", "content": user_content}
         ]
 
-        content, model_used = await self.chat_completion_with_failover(messages, temperature=0.1)
+        content, model_used = await self.chat_completion_with_failover(
+            messages, temperature=0.1, timeout=120.0 if len(raw_text) > 8000 else 45.0
+        )
 
         # Очищаем Markdown json обертки
         clean_json = content
@@ -627,6 +633,34 @@ class OpenRouterService:
                 "task_timings": []
             }
 
+    async def _condense_long_transcript(self, raw_text: str) -> str:
+        """
+        Длинные стенограммы (час и больше) не помещаются в контекст бесплатных моделей.
+        Сжимаем их по частям, сохраняя решения, поручения, имена и сроки, а затем
+        строим протокол по сжатым конспектам.
+        """
+        chunks = [raw_text[i:i + MEETING_CHUNK_CHARS] for i in range(0, len(raw_text), MEETING_CHUNK_CHARS)]
+        logger.info(f"Длинная стенограмма ({len(raw_text)} символов): сжимаю по {len(chunks)} частям...")
+        system_prompt = (
+            "Ты — секретарь совещания. Перед тобой фрагмент длинной стенограммы встречи. "
+            "Составь подробный конспект фрагмента в виде списка: кто что говорил (имена и роли), "
+            "обсуждаемые темы по порядку, принятые решения, поручения (кто, что, к какому сроку), "
+            "открытые вопросы. Сохраняй все имена, цифры и даты. Ответь только конспектом, без вступлений."
+        )
+        parts = []
+        for idx, chunk in enumerate(chunks, 1):
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"ФРАГМЕНТ {idx} из {len(chunks)}:\n\"\"\"\n{chunk}\n\"\"\""}
+            ]
+            try:
+                summary, _ = await self.chat_completion_with_failover(messages, temperature=0.1, timeout=180.0)
+                parts.append(f"=== Часть {idx} ===\n{summary}")
+            except Exception as e:
+                logger.warning(f"Не удалось сжать фрагмент {idx}: {e}")
+                parts.append(f"=== Часть {idx} (без сжатия) ===\n{chunk[:MEETING_CHUNK_CHARS // 4]}")
+        return "Конспект длинной встречи по частям (в хронологическом порядке):\n\n" + "\n\n".join(parts)
+
     async def generate_meeting_protocol(
         self,
         raw_text: str,
@@ -680,12 +714,16 @@ class OpenRouterService:
   ]
 }}
 """
+        meeting_text = raw_text
+        if len(raw_text) > MEETING_CHUNK_CHARS:
+            meeting_text = await self._condense_long_transcript(raw_text)
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"ТЕКСТ ВСТРЕЧИ:\n\"\"\"\n{raw_text}\n\"\"\""}
+            {"role": "user", "content": f"ТЕКСТ ВСТРЕЧИ:\n\"\"\"\n{meeting_text}\n\"\"\""}
         ]
 
-        content, model_used = await self.chat_completion_with_failover(messages, temperature=0.1)
+        content, model_used = await self.chat_completion_with_failover(messages, temperature=0.1, timeout=180.0)
         clean = content.strip()
         if "```json" in clean:
             clean = clean.split("```json")[1].split("```")[0].strip()
@@ -738,11 +776,15 @@ class OpenRouterService:
                 if isinstance(ai, dict):
                     t = _clean_str(ai.get("task"))
                     if t:
+                        due_raw = ai.get("due_date")
+                        priority = str(ai.get("priority") or "medium").lower().strip()
+                        if priority not in ("low", "medium", "high"):
+                            priority = "medium"
                         action_items.append({
                             "task": t,
                             "assignee": _clean_str(ai.get("assignee"), "Не назначен"),
-                            "due_date": ai.get("due_date"),
-                            "priority": ai.get("priority", "medium")
+                            "due_date": parse_datetime_yekt(due_raw) if isinstance(due_raw, str) else None,
+                            "priority": priority
                         })
 
         return {

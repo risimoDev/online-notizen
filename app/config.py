@@ -6,6 +6,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     bot_token: str = Field(..., alias="BOT_TOKEN")
+    # Администраторы бота. ALLOWED_TELEGRAM_IDS поддерживается для обратной совместимости.
+    admin_telegram_ids_raw: str = Field("", alias="ADMIN_TELEGRAM_IDS")
     allowed_telegram_ids_raw: str = Field("", alias="ALLOWED_TELEGRAM_IDS")
     
     openrouter_api_key: str = Field(..., alias="OPENROUTER_API_KEY")
@@ -32,16 +34,25 @@ class Settings(BaseSettings):
         extra="ignore"
     )
 
-    @property
-    def allowed_telegram_ids(self) -> Set[int]:
-        if not self.allowed_telegram_ids_raw.strip():
-            return set()
+    @staticmethod
+    def _parse_ids(raw: str) -> Set[int]:
         ids = set()
-        for item in self.allowed_telegram_ids_raw.split(","):
+        for item in raw.split(","):
             item = item.strip()
             if item.isdigit() or (item.startswith("-") and item[1:].isdigit()):
                 ids.add(int(item))
         return ids
+
+    @property
+    def admin_ids(self) -> Set[int]:
+        """ID администраторов: ADMIN_TELEGRAM_IDS, а если он пуст — ALLOWED_TELEGRAM_IDS."""
+        raw = self.admin_telegram_ids_raw if self.admin_telegram_ids_raw.strip() else self.allowed_telegram_ids_raw
+        return self._parse_ids(raw)
+
+    @property
+    def allowed_telegram_ids(self) -> Set[int]:
+        """Устаревший псевдоним admin_ids."""
+        return self.admin_ids
 
     @property
     def fallback_models_list(self) -> List[str]:

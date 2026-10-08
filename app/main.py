@@ -8,7 +8,8 @@ from aiogram.enums import ParseMode
 from app.config import settings
 from app.database.session import init_db
 from app.middlewares.auth import WhitelistMiddleware
-from app.handlers import common, voice, tasks, notes, crm, planner, meeting, backup
+from app.handlers import common, admin, voice, tasks, notes, crm, planner, meeting, backup
+from app.services.access_service import access_service
 from app.services.scheduler_service import scheduler_service
 
 # Настройка логирования
@@ -27,6 +28,7 @@ async def main():
     # 1. Инициализация базы данных SQLite
     await init_db()
     logger.info(f"База данных успешно инициализирована ({settings.db_path}).")
+    await access_service.load()
 
     # 2. Инициализация бота и диспетчера
     bot = Bot(
@@ -35,14 +37,15 @@ async def main():
     )
     dp = Dispatcher()
 
-    # 3. Подключение Middleware авторизации
+    # 3. Подключение Middleware авторизации (outer — до проверки фильтров)
     whitelist_middleware = WhitelistMiddleware()
-    dp.message.middleware(whitelist_middleware)
-    dp.callback_query.middleware(whitelist_middleware)
+    dp.message.outer_middleware(whitelist_middleware)
+    dp.callback_query.outer_middleware(whitelist_middleware)
 
     # 4. Регистрация роутеров
     # Сначала специализированные команды, затем голосовые, задачи и общий текст
     dp.include_router(common.router)
+    dp.include_router(admin.router)
     dp.include_router(backup.router)
     dp.include_router(crm.router)
     dp.include_router(planner.router)

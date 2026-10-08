@@ -3,11 +3,11 @@ from datetime import datetime
 from typing import Any, List, Optional, Tuple
 from pathlib import Path
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy import select, update, delete, or_, and_, desc
+from sqlalchemy import select, update, delete, or_, and_, desc, event, func
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
-from app.database.models import Base, Note, Task, Contact, ContactInteraction
+from app.database.models import Base, Note, Task, Contact, ContactInteraction, BotUser
 from app.utils.date_utils import get_now_yekt, calculate_remind_at
 
 # Убеждаемся, что папка для базы данных существует
@@ -18,6 +18,25 @@ DATABASE_URL = f"sqlite+aiosqlite:///{settings.db_path}"
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+
+def _py_lower(value):
+    return value.lower() if isinstance(value, str) else value
+
+
+@event.listens_for(engine.sync_engine, "connect")
+def _on_sqlite_connect(dbapi_connection, connection_record):
+    # Без этого SQLite игнорирует ON DELETE CASCADE / SET NULL
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+    # Встроенные LOWER()/LIKE в SQLite регистронезависимы только для ASCII,
+    # поэтому для поиска по кириллице используем Python-реализацию.
+    dbapi_connection.create_function("py_lower", 1, _py_lower, deterministic=True)
+
+
+def _icontains(column, query: str):
+    return func.py_lower(column).contains(query.lower(), autoescape=True)
 
 
 async def init_db():
@@ -110,8 +129,8 @@ async def get_user_notes(user_id: int, limit: int = 10, offset: int = 0) -> List
 
 
 async def search_notes(user_id: int, query: str, limit: int = 15) -> List[Note]:
-    """Поиск по заголовку, содержанию, тезисам и тегам."""
-    pattern = f"%{query.strip()}%"
+    """Поиск по заголовку, содержанию, тезисам и тегам (без учета регистра, в т.ч. для кириллицы)."""
+    query = query.strip()
     async with async_session_maker() as session:
         stmt = (
             select(Note)
@@ -120,11 +139,11 @@ async def search_notes(user_id: int, query: str, limit: int = 15) -> List[Note]:
                 and_(
                     Note.user_id == user_id,
                     or_(
-                        Note.title.ilike(pattern),
-                        Note.raw_content.ilike(pattern),
-                        Note.summary.ilike(pattern),
-                        Note.tags.ilike(pattern),
-                        Note.timeline.ilike(pattern)
+                        _icontains(Note.title, query),
+                        _icontains(Note.raw_content, query),
+                        _icontains(Note.summary, query),
+                        _icontains(Note.tags, query),
+                        _icontains(Note.timeline, query)
                     )
                 )
             )
@@ -133,6 +152,12 @@ async def search_notes(user_id: int, query: str, limit: int = 15) -> List[Note]:
         )
         res = await session.execute(stmt)
         return list(res.scalars().all())
+
+
+async def count_user_notes(user_id: int) -> int:
+    async with async_session_maker() as session:
+        res = await session.execute(select(func.count(Note.id)).where(Note.user_id == user_id))
+        return int(res.scalar_one())
 
 
 async def delete_note_by_id(note_id: int, user_id: int) -> bool:
@@ -399,7 +424,7 @@ async def get_contact_by_name(user_id: int, query_name: str) -> Optional[Contact
         stmt = (
             select(Contact)
             .options(selectinload(Contact.interactions))
-            .where(and_(Contact.user_id == user_id, Contact.normalized_name.ilike(f"%{norm}%")))
+            .where(and_(Contact.user_id == user_id, _icontains(Contact.normalized_name, norm)))
             .order_by(desc(Contact.last_interaction))
             .limit(1)
         )
@@ -449,3 +474,51 @@ async def batch_update_task_timings(user_id: int, task_timings: List[dict]) -> i
                 count += res.rowcount
     return count
 
+
+
+async def get_user_ids_with_pending_tasks() -> List[int]:
+    """Все пользователи, у которых есть незавершенные задачи (для брифингов)."""
+    async with async_session_maker() as session:
+        res = await session.execute(select(Task.user_id).where(Task.status == "pending").distinct())
+        return [int(uid) for uid in res.scalars().all()]
+
+
+# -------------------- Bot Users (Access Control) --------------------
+
+async def get_bot_users() -> List[BotUser]:
+    async with async_session_maker() as session:
+        res = await session.execute(select(BotUser).order_by(BotUser.created_at))
+        return list(res.scalars().all())
+
+
+async def add_bot_user(
+    telegram_id: int,
+    added_by: Optional[int] = None,
+    username: Optional[str] = None,
+    full_name: Optional[str] = None
+) -> Tuple[BotUser, bool]:
+    """Добавляет пользователя (или обновляет имя). Возвращает (user, created)."""
+    async with async_session_maker() as session:
+        async with session.begin():
+            user = await session.get(BotUser, telegram_id)
+            created = user is None
+            if created:
+                user = BotUser(
+                    telegram_id=telegram_id,
+                    added_by=added_by,
+                    created_at=get_now_yekt()
+                )
+                session.add(user)
+            if username:
+                user.username = username.lstrip("@")
+            if full_name:
+                user.full_name = full_name
+            await session.flush()
+            return user, created
+
+
+async def remove_bot_user(telegram_id: int) -> bool:
+    async with async_session_maker() as session:
+        async with session.begin():
+            res = await session.execute(delete(BotUser).where(BotUser.telegram_id == telegram_id))
+            return res.rowcount > 0

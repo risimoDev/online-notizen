@@ -1,5 +1,6 @@
 import os
 import sys
+import sqlite3
 import zipfile
 import tempfile
 from pathlib import Path
@@ -11,8 +12,12 @@ os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-testkey"
 os.environ["TIMEZONE"] = "Asia/Yekaterinburg"
 
 temp_db = Path(tempfile.gettempdir()) / "test_backup_myzapis.db"
-with open(temp_db, "w", encoding="utf-8") as f:
-    f.write("SQLite format 3 - TEST MOCK DATA")
+if temp_db.exists():
+    temp_db.unlink()
+with sqlite3.connect(str(temp_db)) as conn:
+    conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT)")
+    conn.execute("INSERT INTO notes (title) VALUES ('Тестовая заметка')")
+conn.close()
 
 os.environ["DB_PATH"] = str(temp_db)
 
@@ -28,8 +33,16 @@ def test_backup_creation():
     with zipfile.ZipFile(zip_path, "r") as z:
         files = z.namelist()
         assert temp_db.name in files
-        content = z.read(temp_db.name).decode("utf-8")
-        assert "SQLite format 3" in content
+        content = z.read(temp_db.name)
+        assert content.startswith(b"SQLite format 3")
+
+    # Снимок должен быть рабочей базой с теми же данными
+    extracted = Path(tempfile.gettempdir()) / "test_backup_extracted.db"
+    extracted.write_bytes(content)
+    with sqlite3.connect(str(extracted)) as conn:
+        assert conn.execute("SELECT title FROM notes").fetchone()[0] == "Тестовая заметка"
+    conn.close()
+    extracted.unlink()
 
     print(f"   [OK] Резервный ZIP-архив успешно создан и проверен ({zip_path.name}).")
     

@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from aiogram import Router, types, F
 from aiogram.filters import Command
 from aiogram.enums import ChatAction
@@ -7,7 +7,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.database.session import get_user_tasks, batch_update_task_timings
 from app.services.openrouter_service import ai_service
-from app.utils.date_utils import parse_datetime_yekt, get_now_yekt, format_datetime_human
+from app.utils.date_utils import parse_datetime_yekt, get_now_yekt
+from app.utils.text import esc, send_long_html
 
 logger = logging.getLogger(__name__)
 
@@ -17,21 +18,38 @@ router = Router()
 pending_day_plans: Dict[int, List[dict]] = {}
 
 
+def _to_int(value: Any) -> Optional[int]:
+    """ИИ иногда возвращает ID строкой ("3") — приводим к int."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @router.message(Command("plan", "schedule"))
 async def cmd_plan_day(message: types.Message):
     """Интеллектуальное планирование дня (AI Day Planner)."""
-    user_id = message.from_user.id
+    await build_day_plan(message, message.from_user.id)
+
+
+async def build_day_plan(message: types.Message, user_id: int):
     now = get_now_yekt()
     end_of_today = now.replace(hour=23, minute=59, second=59, microsecond=999999)
 
-    tasks = await get_user_tasks(user_id=user_id, status="pending")
+    # Планируем только то, что относится к сегодняшнему дню: задачи без срока, на сегодня и просроченные.
+    # Иначе ИИ переносил на сегодня задачи с дедлайном через неделю, а кнопка «Применить» перезаписывала их сроки.
+    tasks = [
+        t for t in await get_user_tasks(user_id=user_id, status="pending")
+        if t.due_date is None or t.due_date <= end_of_today
+    ]
     if not tasks:
-        await message.answer("🎉 У вас нет незавершенных задач для планирования. Отличный повод отдохнуть или поставить новые цели!")
+        await message.answer("🎉 На сегодня нет незавершенных задач для планирования. Отличный повод отдохнуть или поставить новые цели!")
         return
 
     status_msg = await message.reply("🧠 <i>Анализирую ваши задачи, приоритеты и составляю идеальный график дня...</i>", parse_mode="HTML")
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
+    tasks = tasks[:15]
     tasks_payload = [
         {
             "id": t.id,
@@ -39,7 +57,7 @@ async def cmd_plan_day(message: types.Message):
             "priority": t.priority,
             "due_date": t.due_date.strftime("%Y-%m-%d %H:%M") if t.due_date else None
         }
-        for t in tasks[:15]
+        for t in tasks
     ]
 
     try:
@@ -52,39 +70,42 @@ async def cmd_plan_day(message: types.Message):
         tasks_map = {t.id: t for t in tasks}
         valid_timings = []
         for item in raw_timings:
-            tid = item.get("task_id")
+            if not isinstance(item, dict):
+                continue
+            tid = _to_int(item.get("task_id"))
             due_str = item.get("due_date")
-            parsed_dt = parse_datetime_yekt(due_str)
+            parsed_dt = parse_datetime_yekt(due_str) if isinstance(due_str, str) else None
             if tid in tasks_map and parsed_dt:
                 valid_timings.append({
                     "task_id": tid,
                     "due_date": parsed_dt,
-                    "time_label": item.get("time_label", parsed_dt.strftime("%H:%M"))
+                    "time_label": str(item.get("time_label") or parsed_dt.strftime("%H:%M"))
                 })
 
         pending_day_plans[user_id] = valid_timings
+        timing_labels = {tm["task_id"]: tm["time_label"] for tm in valid_timings}
 
         msg_lines = [
             f"📅 <b>Умный план на день ({now.strftime('%d.%m.%Y')}):</b>\n",
-            f"<i>💡 {overview}</i>\n"
+            f"<i>💡 {esc(overview)}</i>\n"
         ]
 
         for block in blocks:
-            msg_lines.append(f"<b>{block.get('block_title')}</b>")
+            if not isinstance(block, dict):
+                continue
+            msg_lines.append(f"<b>{esc(block.get('block_title') or 'Блок')}</b>")
             if block.get("description"):
-                msg_lines.append(f"<i>{block.get('description')}</i>")
+                msg_lines.append(f"<i>{esc(block.get('description'))}</i>")
 
-            block_tids = block.get("task_ids", [])
-            for tid in block_tids:
+            block_tids = block.get("task_ids") or []
+            if not isinstance(block_tids, list):
+                block_tids = [block_tids]
+            for raw_tid in block_tids:
+                tid = _to_int(raw_tid)
                 if tid in tasks_map:
-                    t = tasks_map[tid]
-                    # Ищем назначенное время
-                    time_label = ""
-                    for tm in valid_timings:
-                        if tm["task_id"] == tid:
-                            time_label = f"[{tm['time_label']}] "
-                            break
-                    msg_lines.append(f"• {time_label}{t.title}")
+                    label = timing_labels.get(tid)
+                    time_label = f"[{esc(label)}] " if label else ""
+                    msg_lines.append(f"• {time_label}{esc(tasks_map[tid].title)}")
             msg_lines.append("")
 
         builder = InlineKeyboardBuilder()
@@ -102,15 +123,11 @@ async def cmd_plan_day(message: types.Message):
             )
         )
 
-        await status_msg.edit_text(
-            "\n".join(msg_lines),
-            parse_mode="HTML",
-            reply_markup=builder.as_markup()
-        )
+        await send_long_html(message, "\n".join(msg_lines), reply_markup=builder.as_markup(), edit_message=status_msg)
 
     except Exception as e:
         logger.exception(f"Ошибка при планировании дня: {e}")
-        await status_msg.edit_text(f"⚠️ Не удалось сформировать график дня: {e}")
+        await status_msg.edit_text(f"⚠️ Не удалось сформировать график дня: {esc(e)}")
 
 
 @router.callback_query(F.data == "apply_day_plan")
@@ -137,4 +154,5 @@ async def cb_apply_day_plan(callback: types.CallbackQuery):
 @router.callback_query(F.data == "regenerate_day_plan")
 async def cb_regenerate_day_plan(callback: types.CallbackQuery):
     await callback.answer("Пересчитываю график...")
-    await cmd_plan_day(callback.message)
+    # callback.message отправлен ботом, поэтому его from_user — сам бот; берем пользователя из callback
+    await build_day_plan(callback.message, callback.from_user.id)
